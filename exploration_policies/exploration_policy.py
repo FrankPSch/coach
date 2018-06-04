@@ -14,21 +14,29 @@
 # limitations under the License.
 #
 
-import numpy as np
-from utils import *
-from configurations import *
+from typing import List
+
+from configurations import Parameters
+from core_types import RunPhase, ActionType
+from spaces import ActionSpace
+
+
+class ExplorationParameters(Parameters):
+    def __init__(self):
+        self.action_space = None
+
+    @property
+    def path(self):
+        return 'exploration_policies.exploration_policy:ExplorationPolicy'
 
 
 class ExplorationPolicy(object):
-    def __init__(self, tuning_parameters):
+    def __init__(self, action_space: ActionSpace):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param action_space: the action space used by the environment
         """
         self.phase = RunPhase.HEATUP
-        self.action_space_size = tuning_parameters.env.action_space_size
-        self.action_abs_range = tuning_parameters.env_instance.action_space_abs_range
-        self.discrete_controls = tuning_parameters.env_instance.discrete_controls
+        self.action_space = action_space
 
     def reset(self):
         """
@@ -37,7 +45,7 @@ class ExplorationPolicy(object):
         """
         pass
 
-    def get_action(self, action_values):
+    def get_action(self, action_values: List[ActionType]) -> ActionType:
         """
         Given a list of values corresponding to each action, 
         choose one actions according to the exploration policy

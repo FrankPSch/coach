@@ -14,35 +14,44 @@
 # limitations under the License.
 #
 
-from exploration_policies.exploration_policy import *
+from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
+from schedules import Schedule
+from spaces import ActionSpace
+import numpy as np
+from core_types import RunPhase, ActionType
+from typing import List
+
+
+class BoltzmannParameters(ExplorationParameters):
+    def __init__(self):
+        super().__init__()
+        self.temperature_schedule = None
+
+    @property
+    def path(self):
+        return 'exploration_policies.boltzmann:Boltzmann'
+
 
 
 class Boltzmann(ExplorationPolicy):
-    def __init__(self, tuning_parameters):
+    def __init__(self, action_space: ActionSpace, temperature_schedule: Schedule):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param action_space: the action space used by the environment
+        :param temperature_schedule: the schedule for the temperature parameter of the softmax
         """
-        ExplorationPolicy.__init__(self, tuning_parameters)
-        self.temperature = tuning_parameters.exploration.initial_temperature
-        self.final_temperature = tuning_parameters.exploration.final_temperature
-        self.temperature_decay_delta = (
-                                       tuning_parameters.exploration.initial_temperature - tuning_parameters.exploration.final_temperature) \
-                                       / float(tuning_parameters.exploration.temperature_decay_steps)
+        super().__init__(action_space)
+        self.temperature_schedule = temperature_schedule
 
-    def decay_temperature(self):
-        if self.temperature > self.final_temperature:
-            self.temperature -= self.temperature_decay_delta
-
-    def get_action(self, action_values):
+    def get_action(self, action_values: List[ActionType]) -> ActionType:
         if self.phase == RunPhase.TRAIN:
-            self.decay_temperature()
+            self.temperature_schedule.step()
         # softmax calculation
-        exp_probabilities = np.exp(action_values / self.temperature)
+        exp_probabilities = np.exp(action_values / self.temperature_schedule.current_value)
         probabilities = exp_probabilities / np.sum(exp_probabilities)
-        probabilities[-1] = 1 - np.sum(probabilities[:-1])  # make sure probs sum to 1
+        # make sure probs sum to 1
+        probabilities[-1] = 1 - np.sum(probabilities[:-1])
         # choose actions according to the probabilities
-        return np.random.choice(range(self.action_space_size), p=probabilities)
+        return np.random.choice(range(self.action_space.shape), p=probabilities)
 
     def get_control_param(self):
-        return self.temperature
+        return self.temperature_schedule.current_value

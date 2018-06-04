@@ -1,17 +1,22 @@
-
+import copy
 import datetime
 import os
 import sys
+import threading
+from utils import Timer
 import time
 from itertools import cycle
 from os import listdir
 from os.path import isfile, join, isdir
 
 from bokeh.models.callbacks import CustomJS
-from bokeh.layouts import row, column, Spacer
-from bokeh.models import ColumnDataSource, Range1d, LinearAxis, Legend
+from bokeh.layouts import row, column, Spacer, ToolbarBox
+from bokeh.models import ColumnDataSource, Range1d, LinearAxis, Legend, \
+    WheelZoomTool, CrosshairTool, UndoTool, RedoTool, ResetTool, SaveTool, HoverTool, Toolbar, PanTool, BoxZoomTool, \
+    Toggle
 from bokeh.models.widgets import RadioButtonGroup, MultiSelect, Button, Select, Slider, Div, CheckboxGroup
 from bokeh.plotting import figure
+from multiprocessing import Process
 
 from dashboard_components.globals import signals_files, x_axis_labels, x_axis_options, show_spinner, hide_spinner, \
     x_axis, dialog, FolderType, RunType, add_directory_csv_files, doc, display_boards, layouts, \
@@ -31,7 +36,10 @@ def update_axis_range(name, range_placeholder):
         max_val = max(max_val, curr_max_val)
         min_val = min(min_val, curr_min_val)
     if min_val != float('inf'):
-        range = max_val - min_val
+        if min_val == max_val:
+            range = 5
+        else:
+            range = max_val - min_val
         range_placeholder.start = min_val - 0.1 * range
         range_placeholder.end = max_val + 0.1 * range
 
@@ -56,13 +64,29 @@ def get_all_selected_signals():
 # update legend using the legend text dictionary
 def update_legend():
     selected_signals = get_all_selected_signals()
+    max_line_length = 50
     items = []
     for signal in selected_signals:
         side_sign = "◀" if signal.axis == 'default' else "▶"
-        items.append((side_sign + " " + signal.full_name, [signal.line]))
+        signal_name = side_sign + " " + signal.full_name
+        # bokeh legend does not respect a max_width parameter so we split the text manually to lines of constant width
+        signal_name = [signal_name[n:n + max_line_length] for n in range(0, len(signal_name), max_line_length)]
+        for idx, substr in enumerate(signal_name):
+            if idx == 0:
+                lines = [signal.line]
+                if signal.show_bollinger_bands:
+                    lines.append(signal.bands)
+                items.append((substr, lines))
+            else:
+                items.append((substr, []))
+
+    if bokeh_legend.items == [] or items == [] or \
+            any([legend_item.renderers != item[1] for legend_item, item in zip(bokeh_legend.items, items)])\
+            or any([legend_item.label != item[0] for legend_item, item in zip(bokeh_legend.items, items)]):
+        bokeh_legend.items = items  # this step takes a long time because it is redrawing the plot
+
     # the visible=false => visible=true is a hack to make the legend render again
     bokeh_legend.visible = False
-    bokeh_legend.items = items  # this step takes a long time because it is redrawing the plot
     bokeh_legend.visible = True
 
 
@@ -105,10 +129,14 @@ def open_directory_dialog():
 def create_files_group_signal(files):
     global selected_file
     signals_file = SignalsFilesGroup(files, plot)
+
     signals_files[signals_file.filename] = signals_file
 
     filenames = [signals_file.filename]
-    files_selector.options += filenames
+    if files_selector.options[0] == "":
+        files_selector.options = filenames
+    else:
+        files_selector.options = files_selector.options + filenames
     files_selector.value = filenames[0]
     selected_file = signals_file
 
@@ -176,15 +204,13 @@ def get_run_type(dir_path):
 # create a signal file from the directory path according to the directory underlying structure
 def handle_dir(dir_path, run_type):
     paths = add_directory_csv_files(dir_path)
-    if run_type in [RunType.SINGLE_FOLDER_SINGLE_FILE,
-                    RunType.SINGLE_FOLDER_MULTIPLE_FILES,
+    if run_type in [RunType.SINGLE_FOLDER_MULTIPLE_FILES,
                     RunType.MULTIPLE_FOLDERS_SINGLE_FILES]:
         create_files_group_signal(paths)
+    elif run_type == RunType.SINGLE_FOLDER_SINGLE_FILE:
+        create_files_signal(paths, use_dir_name=True)
     elif run_type == RunType.MULTIPLE_FOLDERS_MULTIPLE_FILES:
         sub_dirs = [d for d in listdir(dir_path) if isdir(join(dir_path, d))]
-        # for d in sub_dirs:
-        #     paths = add_directory_csv_files(os.path.join(dir_path, d))
-        #     create_files_group_signal(paths)
         create_files_group_signal([os.path.join(dir_path, d) for d in sub_dirs])
 
 
@@ -201,6 +227,8 @@ def load_directory_group():
 
 
 def display_directory_group(directory):
+    pause_auto_update()
+
     display_boards()
     show_spinner("Loading directories group...")
 
@@ -212,20 +240,25 @@ def display_directory_group(directory):
     handle_dir(directory, get_run_type(directory))
 
     change_selected_signals_in_data_selector([""])
+
+    resume_auto_update_according_to_toggle()
     hide_spinner()
 
 
-def create_files_signal(files):
+def create_files_signal(files, use_dir_name=False):
     global selected_file
     new_signal_files = []
     for idx, file_path in enumerate(files):
-        signals_file = SignalsFile(str(file_path), plot=plot)
+        signals_file = SignalsFile(str(file_path), plot=plot, use_dir_name=use_dir_name)
         signals_files[signals_file.filename] = signals_file
         new_signal_files.append(signals_file)
 
     filenames = [f.filename for f in new_signal_files]
 
-    files_selector.options += filenames
+    if files_selector.options[0] == "":
+        files_selector.options = filenames
+    else:
+        files_selector.options = files_selector.options + filenames
     files_selector.value = filenames[0]
     selected_file = new_signal_files[0]
 
@@ -244,37 +277,55 @@ def load_files():
 
 
 def display_files(files):
+    pause_auto_update()
+
     display_boards()
     show_spinner("Loading files...")
 
     create_files_signal(files)
 
     change_selected_signals_in_data_selector([""])
+
+    resume_auto_update_according_to_toggle()
     hide_spinner()
 
 
 def unload_file():
+    global selected_file
     if selected_file is None:
         return
     selected_file.hide_all_signals()
     del signals_files[selected_file.filename]
     data_selector.options = [""]
-    filenames = cycle(files_selector.options)
-    files_selector.options.remove(selected_file.filename)
-    if len(files_selector.options) > 0:
+    filenames_list = copy.copy(files_selector.options)
+    filenames_list.remove(selected_file.filename)
+    if len(filenames_list) == 0:
+        filenames_list = [""]
+    files_selector.options = filenames_list
+    filenames = cycle(filenames_list)
+    if files_selector.options[0] != "":
         files_selector.value = next(filenames)
     else:
         files_selector.value = None
+
     update_legend()
     refresh_info.text = ""
+    if len(signals_files) == 0:
+        selected_file = None
 
 
 # reload the selected csv file
 def reload_all_files(force=False):
+    pause_auto_update()
+
     for file_to_load in signals_files.values():
         if force or file_to_load.file_was_modified_on_disk():
+            show_spinner("Updating files from the disk...")
             file_to_load.load()
-        refresh_info.text = "last update: " + str(datetime.datetime.now()).split(".")[0]
+            hide_spinner()
+        refresh_info.text = "Last Update: " + str(datetime.datetime.now()).split(".")[0]
+
+    resume_auto_update_according_to_toggle()
 
 
 # unselect the currently selected signals and then select the requested signals in the data selector
@@ -301,6 +352,10 @@ def change_data_selector(args, old, new):
         return
     show_spinner("Updating selection...")
     selected_file = signals_files[new]
+    if isinstance(selected_file, SignalsFile):
+        group_cb.disabled = True
+    elif isinstance(selected_file, SignalsFilesGroup):
+        group_cb.disabled = False
     data_selector.remove_on_change('value', select_data)
     data_selector.options = sorted(list(selected_file.signals.keys()))
     data_selector.on_change('value', select_data)
@@ -333,6 +388,9 @@ def change_x_axis(val):
 
     for file_to_load in signals_files.values():
         file_to_load.update_x_axis_index()
+        # this is needed in order to recalculate the mean of all the files
+        if isinstance(file_to_load, SignalsFilesGroup):
+            file_to_load.load()
 
     update_axis_range(x_axis[0], plot.x_range)
     hide_spinner()
@@ -354,11 +412,17 @@ def toggle_second_axis():
 
 
 def toggle_group_property(new):
+    show_spinner("Loading...")
+
     # toggle show / hide Bollinger bands
     selected_file.change_bollinger_bands_state(0 in new)
 
     # show a separate signal for each file in a group
     selected_file.show_files_separately(1 in new)
+
+    update_legend()
+
+    hide_spinner()
 
 
 # Color selection - most of these functions are taken from bokeh examples (plotting/color_sliders.py)
@@ -370,7 +434,23 @@ def select_color(attr, old, new):
     hide_spinner()
 
 
-doc.add_periodic_callback(reload_all_files, 20000)
+def pause_auto_update():
+    toggle_auto_update(False)
+
+
+def resume_auto_update_according_to_toggle():
+    toggle_auto_update(auto_update_toggle_button.active)
+
+
+def toggle_auto_update(new):
+    global file_update_callback
+    if new is False and file_update_callback in doc._session_callbacks:
+        doc.remove_periodic_callback(file_update_callback)
+    elif file_update_callback not in doc._session_callbacks:
+        file_update_callback = doc.add_periodic_callback(reload_all_files, 30000)
+
+
+file_update_callback = doc.add_periodic_callback(reload_all_files, 30000)
 
 # ---------------- Build Website Layout -------------------
 
@@ -379,21 +459,25 @@ refresh_info = Div(text="""""", width=210)
 
 # create figures
 plot = figure(plot_width=1200, plot_height=800,
-              tools='pan,box_zoom,wheel_zoom,crosshair,undo,redo,reset,save',
-              toolbar_location='above', x_axis_label='Episodes',
-              x_range=Range1d(0, 10000), y_range=Range1d(0, 100000))
+              # tools='pan,box_zoom,wheel_zoom,crosshair,undo,redo,reset,save',
+              toolbar_location=None, x_axis_label='Episodes',
+              x_range=Range1d(0, 10000), y_range=Range1d(0, 100000), lod_factor=1000)
 plot.extra_y_ranges = {"secondary": Range1d(start=-100, end=200)}
 plot.add_layout(LinearAxis(y_range_name="secondary"), 'right')
+toolbar = Toolbar(tools=[PanTool(), BoxZoomTool(), WheelZoomTool(), CrosshairTool(), ResetTool(), SaveTool()])
+# plot.toolbar = toolbar
+plot.add_tools(*toolbar.tools)
 plot.yaxis[-1].visible = False
 
 bokeh_legend = Legend(
-    # items=[("12345678901234567890123456789012345678901234567890", [])],  # 50 letters
-    items=[("__________________________________________________", [])],  # 50 letters
-    location=(0, 0), orientation="vertical",
+    items=[("", [])],
+    orientation="vertical",
     border_line_color="black",
     label_text_font_size={'value': '9pt'},
-    margin=30
+    click_policy='hide',
+    visible=False
 )
+bokeh_legend.label_width = 100
 plot.add_layout(bokeh_legend, "right")
 plot.y_range = Range1d(0, 100)
 plot.extra_y_ranges['secondary'] = Range1d(0, 100)
@@ -407,11 +491,17 @@ files_selector_spacer = Spacer(width=10)
 group_selection_button = Button(label="Select Directory", button_type="primary", width=140)
 group_selection_button.on_click(load_directory_group)
 
+update_files_button = Button(label="Update Files", button_type="default", width=50)
+update_files_button.on_click(reload_all_files)
+
+auto_update_toggle_button = Toggle(label="Auto Update", button_type="default", width=50, active=True)
+auto_update_toggle_button.on_click(toggle_auto_update)
+
 unload_file_button = Button(label="Unload", button_type="danger", width=50)
 unload_file_button.on_click(unload_file)
 
 # files selection box
-files_selector = Select(title="Files:", options=[])
+files_selector = Select(title="Files:", options=[""])
 files_selector.on_change('value', change_data_selector)
 
 # data selection box
@@ -419,7 +509,7 @@ data_selector = MultiSelect(title="Data:", options=[], size=12)
 data_selector.on_change('value', select_data)
 
 # x axis selection box
-x_axis_selector_title = Div(text="""X Axis:""")
+x_axis_selector_title = Div(text="""X Axis:""", height=10)
 x_axis_selector = RadioButtonGroup(labels=x_axis_options, active=0)
 x_axis_selector.on_click(change_x_axis)
 
@@ -457,7 +547,9 @@ color_selector.toolbar_location = None
 # main layout of the document
 layout = row(file_selection_button, files_selector_spacer, group_selection_button, width=300)
 layout = column(layout, files_selector)
-layout = column(layout, row(refresh_info, unload_file_button))
+layout = column(layout, row(update_files_button, Spacer(width=50), auto_update_toggle_button,
+                            Spacer(width=50), unload_file_button))
+layout = column(layout, row(refresh_info))
 layout = column(layout, data_selector)
 layout = column(layout, color_selector_title)
 layout = column(layout, color_selector)
@@ -466,7 +558,9 @@ layout = column(layout, x_axis_selector)
 layout = column(layout, group_cb)
 layout = column(layout, toggle_second_axis_button)
 layout = column(layout, averaging_slider)
-layout = row(layout, plot)
+toolbox = ToolbarBox(toolbar=toolbar, toolbar_location='above')
+panel = column(toolbox, plot)
+layout = row(layout, panel)
 
 experiment_board_layout = layout
 

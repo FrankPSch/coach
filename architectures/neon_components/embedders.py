@@ -18,6 +18,8 @@ import ngraph.frontends.neon as neon
 import ngraph as ng
 from ngraph.util.names import name_scope
 
+from core_types import InputEmbedding, InputImageEmbedding, InputVectorEmbedding
+
 
 class InputEmbedder(object):
     def __init__(self, input_size, batch_size=None, activation_function=neon.Rectlin(), name="embedder"):
@@ -29,6 +31,7 @@ class InputEmbedder(object):
         self.biases_init = neon.ConstantInit()
         self.input = None
         self.output = None
+        self.return_type = InputEmbedding
 
     def __call__(self, prev_input_placeholder=None):
         with name_scope(self.get_name()):
@@ -62,6 +65,7 @@ class ImageEmbedder(InputEmbedder):
     def __init__(self, input_size, batch_size=None, input_rescaler=255.0, activation_function=neon.Rectlin(), name="embedder"):
         InputEmbedder.__init__(self, input_size, batch_size, activation_function, name)
         self.input_rescaler = input_rescaler
+        self.return_type = InputImageEmbedding
 
     def _build_module(self):
         # image observation
@@ -79,6 +83,7 @@ class ImageEmbedder(InputEmbedder):
 class VectorEmbedder(InputEmbedder):
     def __init__(self, input_size, batch_size=None, activation_function=neon.Rectlin(), name="embedder"):
         InputEmbedder.__init__(self, input_size, batch_size, activation_function, name)
+        self.return_type = InputVectorEmbedding
 
     def _build_module(self):
         # vector observation

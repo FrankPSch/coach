@@ -13,7 +13,7 @@ signals_files = {}
 selected_file = None
 x_axis = ['Episode #']
 x_axis_options = ['Episode #', 'Total steps', 'Wall-Clock Time']
-x_axis_labels = ['Episode #', 'Total steps', 'Wall-Clock Time (minutes)']
+x_axis_labels = ['Episode #', 'Total steps (per worker)', 'Wall-Clock Time (minutes)']
 current_color = 0
 
 # spinner
@@ -107,7 +107,7 @@ class DialogApp(wx.App):
                 return fileDialog.GetPaths()
 
     def getDirDialog(self):
-        with wx.DirDialog (None, "Choose input directory", "",
+        with wx.DirDialog(None, "Choose input directory", "",
                            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_CHANGE_DIR) as dirDialog:
             if dirDialog.ShowModal() == wx.ID_CANCEL:
                 return None  # the user changed their mind

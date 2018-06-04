@@ -17,15 +17,20 @@
 import json
 import inspect
 import os
+
 import numpy as np
 import threading
 from subprocess import call, Popen
 import signal
-import copy
+from typing import List
+import importlib
+
+import time
 
 killed_processes = []
 
 eps = np.finfo(np.float32).eps
+
 
 class Enum(object):
     def __init__(self):
@@ -55,10 +60,14 @@ class Enum(object):
         raise NameError('enum does not exist')
 
 
-class RunPhase(Enum):
-    HEATUP = "Heatup"
-    TRAIN = "Training"
-    TEST = "Testing"
+def lower_under_to_upper(s):
+    s = s.replace('_', ' ')
+    s = s.title()
+    return s.replace(' ', '')
+
+
+def list_all_presets():
+    return [f.split('.')[0] for f in os.listdir('presets') if f.endswith('.py') and f != '__init__.py']
 
 
 def list_all_classes_in_module(module):
@@ -133,10 +142,10 @@ def parse_int(value):
 
 def set_gpu(gpu_id):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    os.environ['NVIDIA_VISIBLE_DEVICES'] = str(gpu_id)
 
 
 def set_cpu():
+    os.environ["OMP_NUM_THREADS"] = "1"
     set_gpu("")
 
 
@@ -206,6 +215,12 @@ class Signal(object):
             return np.concatenate(self.values)
         else:
             return self.values
+
+    def get_last_value(self):
+        if len(self.values) == 0:
+            return np.nan
+        else:
+            return self._get_values()[-1]
 
     def get_mean(self):
         if len(self.values) == 0:
@@ -334,23 +349,6 @@ def switch_axes_order(observation, from_type='channels_first', to_type='channels
         return np.transpose(observation, (1, 0))
 
 
-class LazyStack(object):
-    """
-    A lazy version of np.stack which avoids copying the memory until it is
-    needed.
-    """
-
-    def __init__(self, history, axis=None):
-        self.history = copy.copy(history)
-        self.axis = axis
-
-    def __array__(self, dtype=None):
-        array = np.stack(self.history, axis=self.axis)
-        if dtype is not None:
-            array = array.astype(dtype)
-        return array
-
-
 def stack_observation(curr_stack, observation, stack_size):
     """
     Adds a new observation to an existing stack of observations from previous time-steps.
@@ -371,6 +369,84 @@ def stack_observation(curr_stack, observation, stack_size):
     return curr_stack
 
 
+def call_method_for_all(instances: List, method: str, args=[], kwargs={}) -> List:
+    """
+    Calls the same function for all the class instances in the group
+    :param instances: a list of class instances to apply the method on
+    :param method: the name of the function to be called
+    :param args: the positional parameters of the method
+    :param kwargs: the named parameters of the method
+    :return: a list of the returns values for all the instances
+    """
+    result = []
+    if not isinstance(args, list):
+        args = [args]
+    sub_methods = method.split('.')  # we allow calling an internal method such as "as_level_manager.train"
+    for instance in instances:
+        sub_instance = instance
+        for sub_method in sub_methods:
+            if not hasattr(sub_instance, sub_method):
+                raise ValueError("The requested instance method {} does not exist for {}"
+                                 .format(sub_method, '.'.join([str(instance.__class__.__name__)] + sub_methods)))
+            sub_instance = getattr(sub_instance, sub_method)
+        result.append(sub_instance(*args, **kwargs))
+    return result
+
+
+def set_member_values_for_all(instances: List, member: str, val) -> None:
+    """
+    Calls the same function for all the class instances in the group
+    :param instances: a list of class instances to apply the method on
+    :param member: the name of the member to be changed
+    :param val: the new value to assign
+    :return: None
+    """
+    for instance in instances:
+        if not hasattr(instance, member):
+            raise ValueError("The requested instance member does not exist")
+        setattr(instance, member, val)
+
+
+def short_dynamic_import(module_path_and_attribute: str, ignore_module_case: bool=False):
+    """
+    Import by "path:attribute"
+    :param module_path_and_attribute: a path to a python file (using dots to separate dirs), followed by a ":" and
+                                      an attribute name to import from the path
+    :return: the requested attribute
+    """
+    return dynamic_import(*module_path_and_attribute.split(':'), ignore_module_case=ignore_module_case)
+
+
+def dynamic_import(module_path: str, class_name: str, ignore_module_case: bool=False):
+    if ignore_module_case:
+        module_name = module_path.split(".")[-1]
+        available_modules = os.listdir(os.path.dirname(module_path.replace('.', '/')))
+        for module in available_modules:
+            curr_module_ext = module.split('.')[-1].lower()
+            curr_module_name = module.split('.')[0]
+            if curr_module_ext == "py" and curr_module_name.lower() == module_name.lower():
+                module_path = '.'.join(module_path.split(".")[:-1] + [curr_module_name])
+    module = importlib.import_module(module_path)
+    class_ref = getattr(module, class_name)
+    return class_ref
+
+
+def dynamic_import_and_instantiate_module_from_params(module_parameters, path=None, positional_args=[]):
+    """
+    A function dedicated for coach modules like memory, exploration policy, etc.
+    Given the module parameters, it imports it and instantiates it.
+    :param module_parameters:
+    :return:
+    """
+    import inspect
+    if path is None:
+        path = module_parameters.path
+    module = short_dynamic_import(path)
+    args = set(inspect.getfullargspec(module).args).intersection(module_parameters.__dict__)
+    args = {k: module_parameters.__dict__[k] for k in args}
+    return short_dynamic_import(path)(*positional_args, **args)
+
+
 def last_sample(state):
     """
     given a batch of states, return the last sample of the batch with length 1
@@ -380,3 +456,44 @@ def last_sample(state):
         k: np.expand_dims(v[-1], 0)
         for k, v in state.items()
     }
+
+
+def get_all_subclasses(cls):
+    if len(cls.__subclasses__()) == 0:
+        return []
+    ret = []
+    for drv in cls.__subclasses__():
+        ret.append(drv)
+        ret.extend(get_all_subclasses(drv))
+
+    return ret
+
+
+class SharedMemoryScratchPad(object):
+    def __init__(self):
+        self.dict = {}
+
+    def add(self, key, value):
+        self.dict[key] = value
+
+    def get(self, key, timeout=30):
+        start_time = time.time()
+        timeout_passed = False
+        while key not in self.dict and not timeout_passed:
+            time.sleep(0.1)
+            timeout_passed = (time.time() - start_time) > timeout
+
+        if timeout_passed:
+            return None
+        return self.dict[key]
+
+
+class Timer(object):
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def __enter__(self):
+        self.start = time.time()
+
+    def __exit__(self, type, value, traceback):
+        print(self.prefix, time.time() - self.start)

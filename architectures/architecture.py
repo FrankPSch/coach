@@ -14,35 +14,30 @@
 # limitations under the License.
 #
 
-from configurations import Preset
+from configurations import AgentParameters
+from spaces import SpacesDefinition
 
 
 class Architecture(object):
-    def __init__(self, tuning_parameters, name=""):
+    def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, name: str= ""):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
-        :param name: The name of the network
-        :param name: string
+        :param agent_parameters: the agent parameters
+        :param spaces: the spaces (observation, action, etc.) definition of the agent
+        :param name: the name of the network
         """
-        self.batch_size = tuning_parameters.batch_size
-        self.input_depth = tuning_parameters.env.observation_stack_size
-        self.input_height = tuning_parameters.env.desired_observation_height
-        self.input_width = tuning_parameters.env.desired_observation_width
-        self.num_actions = tuning_parameters.env.action_space_size
-        self.measurements_size = tuning_parameters.env.measurements_size \
-            if tuning_parameters.env.measurements_size else 0
-        self.learning_rate = tuning_parameters.learning_rate
-        self.optimizer = None
-        self.name = name
-        self.tp = tuning_parameters
+        # spaces
+        self.spaces = spaces
 
-    def get_model(self, tuning_parameters):
-        """
-        :param tuning_parameters: A Preset class instance with all the running parameters
-        :type tuning_parameters: Preset
-        :return: A model
-        """
+        self.name = name
+        self.network_wrapper_name = self.name.split('/')[0]  # the name can be main/online and the network_wrapper_name will be main
+        self.full_name = "{}/{}".format(agent_parameters.full_name_id, name)
+        self.network_parameters = agent_parameters.network_wrappers[self.network_wrapper_name]
+        self.batch_size = self.network_parameters.batch_size
+        self.learning_rate = self.network_parameters.learning_rate
+        self.optimizer = None
+        self.ap = agent_parameters
+
+    def get_model(self):
         pass
 
     def predict(self, inputs):

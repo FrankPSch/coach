@@ -14,19 +14,31 @@
 # limitations under the License.
 #
 
-from exploration_policies.exploration_policy import *
+from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
+from spaces import ActionSpace, Discrete, Box
+import numpy as np
+from core_types import ActionType
+from typing import List
+
+
+class GreedyParameters(ExplorationParameters):
+    @property
+    def path(self):
+        return 'exploration_policies.greedy:Greedy'
 
 
 class Greedy(ExplorationPolicy):
-    def __init__(self, tuning_parameters):
+    def __init__(self, action_space: ActionSpace):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param action_space: the action space used by the environment
         """
-        ExplorationPolicy.__init__(self, tuning_parameters)
+        super().__init__(action_space)
 
-    def get_action(self, action_values):
-        return np.argmax(action_values)
+    def get_action(self, action_values: List[ActionType]) -> ActionType:
+        if type(self.action_space) == Discrete:
+            return np.argmax(action_values)
+        if type(self.action_space) == Box:
+            return action_values
 
     def get_control_param(self):
         return 0

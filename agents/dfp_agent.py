@@ -13,74 +13,107 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import Union
 
-from agents.agent import *
+from agents.agent import Agent
+import numpy as np
+from core_types import ActionInfo
+from configurations import AlgorithmParameters, AgentParameters, NetworkParameters, OutputTypes, \
+    MiddlewareTypes, InputEmbedderParameters
+from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
+from exploration_policies.e_greedy import EGreedyParameters
+from spaces import SpacesDefinition, MeasurementsObservationSpace
+
+
+class DFPNetworkParameters(NetworkParameters):
+    def __init__(self):
+        super().__init__()
+        self.input_types = {'observation': InputEmbedderParameters(),
+                            'measurements': InputEmbedderParameters(),
+                            'goal': InputEmbedderParameters()}
+        self.middleware_type = MiddlewareTypes.FC
+        self.output_types = [OutputTypes.MeasurementsPrediction]
+        self.loss_weights = [1.0]
+        self.async_training = True
+
+
+class DFPMemoryParameters(EpisodicExperienceReplayParameters):
+    def __init__(self):
+        super().__init__()
+        self.num_predicted_steps_ahead = 6
+
+
+class DFPAlgorithmParameters(AlgorithmParameters):
+    def __init__(self):
+        super().__init__()
+        self.num_predicted_steps_ahead = 6
+        self.state_values_to_use = ['observation', 'measurements', 'goal']
+        self.goal_vector = [1.0, 1.0]
+        self.future_measurements_weights = [0.5, 0.5, 1.0]
+        self.use_accumulated_reward_as_measurement = False
+
+
+class DFPAgentParameters(AgentParameters):
+    def __init__(self):
+        super().__init__(algorithm=DFPAlgorithmParameters(),
+                         exploration=EGreedyParameters(),
+                         memory=EpisodicExperienceReplayParameters(),
+                         networks={"main": DFPNetworkParameters()})
+
+    @property
+    def path(self):
+        return 'agents.dfp_agent:DFPAgent'
 
 
 # Direct Future Prediction Agent - http://vladlen.info/papers/learning-to-act.pdf
 class DFPAgent(Agent):
-    def __init__(self, env, tuning_parameters, replicated_device=None, thread_id=0):
-        Agent.__init__(self, env, tuning_parameters, replicated_device, thread_id)
-        self.current_goal = self.tp.agent.goal_vector
-        self.main_network = NetworkWrapper(tuning_parameters, False, self.has_global, 'main',
-                                           self.replicated_device, self.worker_device)
-        self.networks.append(self.main_network)
+    def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
+        super().__init__(agent_parameters, parent)
+        self.current_goal = self.ap.algorithm.goal_vector
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, total_returns = self.extract_batch(batch)
-
-        # create the inputs for the network
-        input = current_states
-        input['goal'] = np.repeat(np.expand_dims(self.current_goal, 0), self.tp.batch_size, 0)
+        current_states, next_states, actions, rewards, game_overs, total_returns = self.extract_batch(batch, 'main')
 
         # get the current outputs of the network
-        targets = self.main_network.online_network.predict(input)
+        targets = self.networks['main'].online_network.predict(current_states)
 
         # change the targets for the taken actions
-        for i in range(self.tp.batch_size):
+        for i in range(self.ap.network_wrappers['main'].batch_size):
             targets[i, actions[i]] = batch[i].info['future_measurements'].flatten()
 
-        result = self.main_network.train_and_sync_networks(input, targets)
-        total_loss = result[0]
+        result = self.networks['main'].train_and_sync_networks(current_states, targets)
+        total_loss, losses, unclipped_grads = result[:3]
 
-        return total_loss
+        return total_loss, losses, unclipped_grads
 
-    def choose_action(self, curr_state, phase=RunPhase.TRAIN):
-        # convert to batch so we can run it through the network
-        observation = np.expand_dims(np.array(curr_state['observation']), 0)
-        measurements = np.expand_dims(np.array(curr_state['measurements']), 0)
-        goal = np.expand_dims(self.current_goal, 0)
-
+    def choose_action(self, curr_state):
         # predict the future measurements
-        measurements_future_prediction = self.main_network.online_network.predict({
-            "observation": observation,
-            "measurements": measurements,
-            "goal": goal})[0]
-        action_values = np.zeros((self.action_space_size,))
-        num_steps_used_for_objective = len(self.tp.agent.future_measurements_weights)
+        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'main')
+        measurements_future_prediction = self.networks['main'].online_network.predict(tf_input_state)[0]
+        action_values = np.zeros((self.spaces.action.shape,))
+        num_steps_used_for_objective = len(self.ap.algorithm.future_measurements_weights)
 
         # calculate the score of each action by multiplying it's future measurements with the goal vector
-        for action_idx in range(self.action_space_size):
+        for action_idx in range(self.spaces.action.shape):
             action_measurements = measurements_future_prediction[action_idx]
             action_measurements = np.reshape(action_measurements,
-                                             (self.tp.agent.num_predicted_steps_ahead, self.measurements_size[0]))
+                                             (self.ap.algorithm.num_predicted_steps_ahead, self.spaces.measurements.shape))
             future_steps_values = np.dot(action_measurements, self.current_goal)
             action_values[action_idx] = np.dot(future_steps_values[-num_steps_used_for_objective:],
-                                               self.tp.agent.future_measurements_weights)
+                                               self.ap.algorithm.future_measurements_weights)
 
         # choose action according to the exploration policy and the current phase (evaluating or training the agent)
-        if phase == RunPhase.TRAIN:
-            action = self.exploration_policy.get_action(action_values)
-        else:
-            action = np.argmax(action_values)
+        action = self.exploration_policy.get_action(action_values)
 
         action_values = action_values.squeeze()
 
-        # store information for plotting interactively (actual plotting is done in agent)
-        if self.tp.visualization.plot_action_values_online:
-            for idx, action_name in enumerate(self.env.actions_description):
-                self.episode_running_info[action_name].append(action_values[idx])
-
-        action_info = {"action_probability": 0, "action_value": action_values[action]}
-
+        action_info = ActionInfo(action=action, action_value=action_values[action])
         return action, action_info
+
+    def set_environment_parameters(self, spaces: SpacesDefinition):
+        super().set_environment_parameters(spaces)
+        self.spaces.state['goal'] = MeasurementsObservationSpace(shape=self.spaces.state['measurements'].shape,
+                                                                 low=self.spaces.state['measurements'].low,
+                                                                 high=self.spaces.state['measurements'].high)
+
+

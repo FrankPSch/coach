@@ -19,6 +19,8 @@ import ngraph.frontends.neon as neon
 from ngraph.util.names import name_scope
 import numpy as np
 
+from core_types import MiddlewareEmbedding, Middleware_FC_Embedding
+
 
 class MiddlewareEmbedder(object):
     def __init__(self, activation_function=neon.Rectlin(), name="middleware_embedder"):
@@ -28,6 +30,7 @@ class MiddlewareEmbedder(object):
         self.weights_init = neon.GlorotInit()
         self.biases_init = neon.ConstantInit()
         self.activation_function = activation_function
+        self.return_type = MiddlewareEmbedding
 
     def __call__(self, input_layer):
         with name_scope(self.get_name()):
@@ -44,6 +47,10 @@ class MiddlewareEmbedder(object):
 
 
 class FC_Embedder(MiddlewareEmbedder):
+    def __init__(self, activation_function=neon.Rectlin(), name="middleware_embedder"):
+        super().__init__(activation_function=activation_function, name=name)
+        self.return_type = Middleware_FC_Embedding
+
     def _build_module(self):
         self.output = neon.Sequential([
                 neon.Affine(nout=512, activation=self.activation_function,

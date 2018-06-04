@@ -18,6 +18,8 @@ import ngraph as ng
 from ngraph.util.names import name_scope
 import ngraph.frontends.neon as neon
 import numpy as np
+
+from core_types import QActionStateValue, Measurements
 from utils import force_list
 from architectures.neon_components.losses import *
 
@@ -37,6 +39,7 @@ class Head(object):
         self.input = []
         self.is_local = is_local
         self.batch_size = tuning_parameters.batch_size
+        self.return_type = None
 
     def __call__(self, input_layer):
         """
@@ -107,6 +110,7 @@ class QHead(Head):
             raise Exception("huber loss is not supported in neon")
         else:
             self.loss_type = mean_squared_error
+        self.return_type = QActionStateValue
 
     def _build_module(self, input_layer):
         # Standard Q Network
@@ -156,6 +160,7 @@ class MeasurementsPredictionHead(Head):
             if tuning_parameters.env.measurements_size else 0
         self.num_prediction_steps = tuning_parameters.agent.num_predicted_steps_ahead
         self.multi_step_measurements_size = self.num_measurements * self.num_prediction_steps
+        self.return_type = Measurements
         if tuning_parameters.agent.replace_mse_with_huber_loss:
             raise Exception("huber loss is not supported in neon")
         else:

@@ -6,6 +6,8 @@ from dashboard_components.signals import Signal
 import numpy as np
 import copy
 
+from utils import Timer
+
 
 class SignalsFileBase:
     def __init__(self, plot):
@@ -32,7 +34,7 @@ class SignalsFileBase:
         self.bokeh_source.data['index'] = self.bokeh_source.data[x_axis[0]]
 
     def toggle_y_axis(self, signal_name=None):
-        if signal_name:
+        if signal_name and signal_name in self.signals.keys():
             self.signals[signal_name].toggle_axis()
         else:
             for signal in self.signals.values():
@@ -42,15 +44,14 @@ class SignalsFileBase:
     def update_source_and_signals(self):
         # create bokeh data sources
         self.bokeh_source_orig = ColumnDataSource(self.csv)
-        self.bokeh_source_orig.data['index'] = self.bokeh_source_orig.data[x_axis[0]]
 
         if self.bokeh_source is None:
             self.bokeh_source = ColumnDataSource(self.csv)
+            self.update_x_axis_index()
         else:
+            self.update_x_axis_index()
             # smooth the data if necessary
             self.change_averaging_window(self.signals_averaging_window, force=True)
-
-        self.update_x_axis_index()
 
         # create all the signals
         if len(self.signals.keys()) == 0:
@@ -71,7 +72,7 @@ class SignalsFileBase:
 
     def reload_data(self):
         # this function is a workaround to reload the data of all the signals
-        # if the data doesn't change, bokeh does not refreshes the line
+        # if the data doesn't change, bokeh does not refresh the line
         temp_data = self.bokeh_source.data.copy()
         for col in self.bokeh_source.data.keys():
             if not self.last_reload_data_fix:

@@ -84,7 +84,7 @@ class GeneralNeonNetwork(NeonArchitecture):
             OutputTypes.PPO: None, # PPO over Neon is currently not supported in Coach
             OutputTypes.PPO_V: None  # PPO over Neon is currently not supported in Coach
         }
-        return output_mapping[head_type](self.tp, head_idx, loss_weight, self.network_is_local)
+        return output_mapping[head_type](self.ap, head_idx, loss_weight, self.network_is_local)
 
     def get_model(self, tuning_parameters):
         """
@@ -92,11 +92,11 @@ class GeneralNeonNetwork(NeonArchitecture):
         :type tuning_parameters: Preset
         :return: A model
         """
-        assert len(self.tp.agent.input_types) > 0, "At least one input type should be defined"
-        assert len(self.tp.agent.output_types) > 0, "At least one output type should be defined"
-        assert self.tp.agent.middleware_type is not None, "Exactly one middleware type should be defined"
-        assert len(self.tp.agent.loss_weights) > 0, "At least one loss weight should be defined"
-        assert len(self.tp.agent.output_types) == len(self.tp.agent.loss_weights), \
+        assert len(self.ap.agent.input_types) > 0, "At least one input type should be defined"
+        assert len(self.ap.agent.output_types) > 0, "At least one output type should be defined"
+        assert self.ap.agent.middleware_type is not None, "Exactly one middleware type should be defined"
+        assert len(self.ap.agent.loss_weights) > 0, "At least one loss weight should be defined"
+        assert len(self.ap.agent.output_types) == len(self.ap.path.loss_weights), \
             "Number of loss weights should match the number of output types"
         local_network_in_distributed_training = self.global_network is not None and self.network_is_local
 
@@ -110,7 +110,7 @@ class GeneralNeonNetwork(NeonArchitecture):
                 ####################
 
                 state_embedding = []
-                for idx, input_type in enumerate(self.tp.agent.input_types):
+                for idx, input_type in enumerate(self.ap.agent.input_types):
                     # get the class of the input embedder
                     self.input_embedders.append(self.get_input_embedder(input_type))
 
@@ -119,7 +119,7 @@ class GeneralNeonNetwork(NeonArchitecture):
 
                     # create the input embedder instance and store the input placeholder and the embedding
                     input_placeholder, embedding = self.input_embedders[-1](prev_network_input_placeholder)
-                    if len(self.inputs) < len(self.tp.agent.input_types):
+                    if len(self.inputs) < len(self.ap.agent.input_types):
                         self.inputs.append(input_placeholder)
                     state_embedding.append(embedding)
 
@@ -131,7 +131,7 @@ class GeneralNeonNetwork(NeonArchitecture):
 
                 state_embedding = ng.concat_along_axis(state_embedding, state_embedding[0].axes[0]) \
                     if len(state_embedding) > 1 else state_embedding[0]
-                self.middleware_embedder = self.get_middleware_embedder(self.tp.agent.middleware_type)
+                self.middleware_embedder = self.get_middleware_embedder(self.ap.agent.middleware_type)
                 _, self.state_embedding = self.middleware_embedder(state_embedding)
 
                 ################
@@ -139,16 +139,16 @@ class GeneralNeonNetwork(NeonArchitecture):
                 ################
 
                 for head_idx in range(self.num_heads_per_network):
-                    for head_copy_idx in range(self.tp.agent.num_output_head_copies):
-                        if self.tp.agent.use_separate_networks_per_head:
+                    for head_copy_idx in range(self.ap.agent.num_output_head_copies):
+                        if self.ap.agent.use_separate_networks_per_head:
                             # if we use separate networks per head, then the head type corresponds top the network idx
                             head_type_idx = network_idx
                         else:
                             # if we use a single network with multiple heads, then the head type is the current head idx
                             head_type_idx = head_idx
-                        self.output_heads.append(self.get_output_head(self.tp.agent.output_types[head_type_idx],
+                        self.output_heads.append(self.get_output_head(self.ap.agent.output_types[head_type_idx],
                                                                       head_copy_idx,
-                                                                      self.tp.agent.loss_weights[head_type_idx]))
+                                                                      self.ap.agent.loss_weights[head_type_idx]))
                         if self.network_is_local:
                             output, target_placeholder, input_placeholder = self.output_heads[-1](self.state_embedding)
                             self.targets.extend(target_placeholder)
@@ -165,12 +165,12 @@ class GeneralNeonNetwork(NeonArchitecture):
         self.total_loss = sum(self.losses)
 
         # Learning rate
-        if self.tp.learning_rate_decay_rate != 0:
+        if self.ap.learning_rate_decay_rate != 0:
             raise Exception("learning rate decay is not supported in neon")
 
         # Optimizer
         if local_network_in_distributed_training and \
-                hasattr(self.tp.agent, "shared_optimizer") and self.tp.agent.shared_optimizer:
+                hasattr(self.ap.agent, "shared_optimizer") and self.ap.path.shared_optimizer:
             # distributed training and this is the local network instantiation
             self.optimizer = self.global_network.optimizer
         else:

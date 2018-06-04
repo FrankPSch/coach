@@ -13,53 +13,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import Union
 
-from agents.agent import *
+from agents.agent import Agent
+from core_types import RunPhase, ActionInfo
+from logger import screen
+from collections import OrderedDict
+from spaces import Discrete
 
 
 # Imitation Agent
 class ImitationAgent(Agent):
-    def __init__(self, env, tuning_parameters, replicated_device=None, thread_id=0):
-        Agent.__init__(self, env, tuning_parameters, replicated_device, thread_id)
-        self.main_network = NetworkWrapper(tuning_parameters, False, self.has_global, 'main',
-                                           self.replicated_device, self.worker_device)
-        self.networks.append(self.main_network)
+    def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
+        super().__init__(agent_parameters, parent)
+
         self.imitation = True
 
     def extract_action_values(self, prediction):
         return prediction.squeeze()
 
-    def choose_action(self, curr_state, phase=RunPhase.TRAIN):
+    def choose_action(self, curr_state):
         # convert to batch so we can run it through the network
-        prediction = self.main_network.online_network.predict(self.tf_input_state(curr_state))
+        prediction = self.networks['main'].online_network.predict(self.dict_state_to_batches_dict(curr_state, 'main'))
 
         # get action values and extract the best action from it
         action_values = self.extract_action_values(prediction)
-        if self.env.discrete_controls:
+        if type(self.spaces.action) == Discrete:
             # DISCRETE
-            # action = np.argmax(action_values)
-            action = self.evaluation_exploration_policy.get_action(action_values)
-            action_value = {"action_probability": action_values[action]}
+            # TODO: refactor
+            self.exploration_policy.phase = RunPhase.TEST
+            action = self.exploration_policy.get_action(action_values)
+
+            action_info = ActionInfo(action=action,
+                                     action_probability=action_values[action])
         else:
             # CONTINUOUS
             action = action_values
-            action_value = {}
 
-        return action, action_value
+            action_info = ActionInfo(action=action)
 
-    def log_to_screen(self, phase):
+        return action_info
+
+    def log_to_screen(self):
         # log to screen
-        if phase == RunPhase.TRAIN:
+        if self.phase == RunPhase.TRAIN:
             # for the training phase - we log during the episode to visualize the progress in training
-            screen.log_dict(
-                OrderedDict([
-                    ("Worker", self.task_id),
-                    ("Episode", self.current_episode),
-                    ("Loss", self.loss.values[-1]),
-                    ("Training iteration", self.training_iteration)
-                ]),
-                prefix="Training"
-            )
+            log = OrderedDict()
+            if self.task_id is not None:
+                log["Worker"] = self.task_id
+            log["Episode"] = self.current_episode
+            log["Loss"] = self.loss.values[-1]
+            log["Training iteration"] = self.training_iteration
+            screen.log_dict(log, prefix="Training")
         else:
             # for the evaluation phase - logging as in regular RL
-            Agent.log_to_screen(self, phase)
+            super().log_to_screen()

@@ -15,38 +15,61 @@
 #
 
 import numpy as np
-from exploration_policies.exploration_policy import *
+from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
+from spaces import ActionSpace
+from core_types import RunPhase, ActionType
+from typing import List
+
 
 # Based on on the description in:
 # https://math.stackexchange.com/questions/1287634/implementing-ornstein-uhlenbeck-in-matlab
+class OUProcessParameters(ExplorationParameters):
+    def __init__(self):
+        super().__init__()
+        self.mu = 0
+        self.theta = 0.15
+        self.sigma = 0.2
+        self.dt = 0.01
+
+    @property
+    def path(self):
+        return 'exploration_policies.ou_process:OUProcess'
+
 
 # Ornstein-Uhlenbeck process
 class OUProcess(ExplorationPolicy):
-    def __init__(self, tuning_parameters):
+    def __init__(self, action_space: ActionSpace, mu: float, theta: float, sigma: float, dt: float):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param action_space: the action space used by the environment
         """
-        ExplorationPolicy.__init__(self, tuning_parameters)
-        self.action_space_size = tuning_parameters.env.action_space_size
-        self.mu = float(tuning_parameters.exploration.mu) * np.ones(self.action_space_size)
-        self.theta = tuning_parameters.exploration.theta
-        self.sigma = float(tuning_parameters.exploration.sigma) * np.ones(self.action_space_size)
-        self.state = np.zeros(self.action_space_size)
-        self.dt = tuning_parameters.exploration.dt
+        super().__init__(action_space)
+        self.mu = float(mu) * np.ones(self.action_space.shape)
+        self.theta = float(theta)
+        self.sigma = float(sigma) * np.ones(self.action_space.shape)
+        self.state = np.zeros(self.action_space.shape)
+        self.dt = dt
 
     def reset(self):
-        self.state = np.zeros(self.action_space_size)
+        self.state = np.zeros(self.action_space.shape)
 
     def noise(self):
         x = self.state
         dx = self.theta * (self.mu - x) * self.dt + self.sigma * np.random.randn(len(x)) * np.sqrt(self.dt)
         self.state = x + dx
-        return self.state[0]
+        return self.state
 
-    def get_action(self, action_values):
-        noise = self.noise()
-        return action_values.squeeze() + noise
+    def get_action(self, action_values: List[ActionType]) -> ActionType:
+        if self.phase == RunPhase.TRAIN:
+            noise = self.noise()
+        else:
+            noise = np.zeros(self.action_space.shape)
+
+        action = action_values.squeeze() + noise
+        action = self.action_space.clip_action_to_space(action)
+        return action
 
     def get_control_param(self):
-        return self.state[0]
+        if self.phase == RunPhase.TRAIN:
+            return self.state
+        else:
+            return np.zeros(self.action_space.shape)

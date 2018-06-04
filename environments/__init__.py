@@ -14,23 +14,21 @@
 # limitations under the License.
 #
 
-from logger import *
-from utils import Enum, get_open_port
-from environments.gym_environment_wrapper import *
-from environments.doom_environment_wrapper import *
-from environments.carla_environment_wrapper import *
+from utils import Enum
+# TODO: do we really need this? currently it's just for warning about uninstalled environments
+# from environments.gym_environment import GymEnvironment
+# from environments.doom_environment import DoomEnvironment
+# from environments.carla_environment import CarlaEnvironment
 
 
 class EnvTypes(Enum):
-    Doom = "DoomEnvironmentWrapper"
-    Gym = "GymEnvironmentWrapper"
-    Carla = "CarlaEnvironmentWrapper"
+    Doom = "DoomEnvironment"
+    Gym = "GymEnvironment"
+    Carla = "CarlaEnvironment"
 
 
 def create_environment(tuning_parameters):
     env_type_name, env_type = EnvTypes().verify(tuning_parameters.env.type)
     env = eval(env_type)(tuning_parameters)
     return env
-
-
 

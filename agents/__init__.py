@@ -13,26 +13,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
-from agents.actor_critic_agent import *
-from agents.agent import *
-from agents.bc_agent import *
-from agents.bootstrapped_dqn_agent import *
-from agents.clipped_ppo_agent import *
-from agents.ddpg_agent import *
-from agents.ddqn_agent import *
-from agents.dfp_agent import *
-from agents.dqn_agent import *
-from agents.categorical_dqn_agent import *
-from agents.human_agent import *
-from agents.imitation_agent import *
-from agents.mmc_agent import *
-from agents.n_step_q_agent import *
-from agents.naf_agent import *
-from agents.nec_agent import *
-from agents.pal_agent import *
-from agents.policy_gradients_agent import *
-from agents.policy_optimization_agent import *
-from agents.ppo_agent import *
-from agents.value_optimization_agent import *
-from agents.qr_dqn_agent import *

@@ -15,6 +15,7 @@ class Signal:
         self.selected = False
         self.color = random.choice(Dark2[8])
         self.line = None
+        self.scatter = None
         self.bands = None
         self.bokeh_source = parent.bokeh_source
         self.min_val = 0
@@ -57,6 +58,7 @@ class Signal:
             self.create_bands()
         self.line = self.plot.line('index', self.mean_signal, source=self.bokeh_source,
                                    line_color=self.color, line_width=2)
+        # self.scatter = self.plot.scatter('index', self.mean_signal, source=self.bokeh_source)
         self.line.visible = True
 
     def set_selected(self, val):

@@ -19,55 +19,58 @@ import numpy as np
 
 
 class SharedRunningStats(object):
-    def __init__(self, tuning_parameters, replicated_device, epsilon=1e-2, shape=(), name=""):
-        self.tp = tuning_parameters
+    def __init__(self, replicated_device, epsilon=1e-2, name=""):
+        self.sess = None
         with tf.device(replicated_device):
             with tf.variable_scope(name):
                 self._sum = tf.get_variable(
                     dtype=tf.float64,
-                    shape=shape,
                     initializer=tf.constant_initializer(0.0),
-                    name="running_sum", trainable=False)
+                    name="running_sum", trainable=False, shape=[1], validate_shape=False)
                 self._sum_squared = tf.get_variable(
                     dtype=tf.float64,
-                    shape=shape,
                     initializer=tf.constant_initializer(epsilon),
-                    name="running_sum_squared", trainable=False)
+                    name="running_sum_squared", trainable=False, shape=[1], validate_shape=False)
                 self._count = tf.get_variable(
                     dtype=tf.float64,
                     shape=(),
                     initializer=tf.constant_initializer(epsilon),
                     name="count", trainable=False)
 
-                self._shape = shape
+                self._shape = None
                 self._mean = self._sum / self._count
                 self._std = tf.sqrt(tf.maximum((self._sum_squared - self._count*tf.square(self._mean))
                                                / tf.maximum(self._count-1, 1), epsilon))
 
-                self.new_sum = tf.placeholder(shape=self.shape, dtype=tf.float64, name='sum')
-                self.new_sum_squared = tf.placeholder(shape=self.shape, dtype=tf.float64, name='var')
+                self.new_sum = tf.placeholder(dtype=tf.float64, name='sum')
+                self.new_sum_squared = tf.placeholder(dtype=tf.float64, name='var')
                 self.newcount = tf.placeholder(shape=[], dtype=tf.float64, name='count')
 
                 self._inc_sum = tf.assign_add(self._sum, self.new_sum, use_locking=True)
                 self._inc_sum_squared = tf.assign_add(self._sum_squared, self.new_sum_squared, use_locking=True)
                 self._inc_count = tf.assign_add(self._count, self.newcount, use_locking=True)
 
+    def set_session(self, sess):
+        self.sess = sess
+
     def push(self, x):
         x = x.astype('float64')
-        self.tp.sess.run([self._inc_sum, self._inc_sum_squared, self._inc_count],
+        self.sess.run([self._inc_sum, self._inc_sum_squared, self._inc_count],
                          feed_dict={
                              self.new_sum: x.sum(axis=0).ravel(),
                              self.new_sum_squared: np.square(x).sum(axis=0).ravel(),
                              self.newcount: np.array(len(x), dtype='float64')
                          })
+        if self._shape is None:
+            self._shape = x.shape
 
     @property
     def n(self):
-        return self.tp.sess.run(self._count)
+        return self.sess.run(self._count)
 
     @property
     def mean(self):
-        return self.tp.sess.run(self._mean)
+        return self.sess.run(self._mean)
 
     @property
     def var(self):
@@ -75,7 +78,7 @@ class SharedRunningStats(object):
 
     @property
     def std(self):
-        return self.tp.sess.run(self._std)
+        return self.sess.run(self._std)
 
     @property
     def shape(self):

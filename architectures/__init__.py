@@ -13,19 +13,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
-from architectures.architecture import *
-from logger import failed_imports
-try:
-    from architectures.tensorflow_components.general_network import *
-    from architectures.tensorflow_components.architecture import *
-except ImportError:
-    failed_imports.append("TensorFlow")
-
-try:
-    from architectures.neon_components.general_network import *
-    from architectures.neon_components.architecture import *
-except ImportError:
-    failed_imports.append("Neon")
-
-from architectures.network_wrapper import *

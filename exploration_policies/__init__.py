@@ -13,16 +13,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
-from exploration_policies.additive_noise import *
-from exploration_policies.approximated_thompson_sampling_using_dropout import *
-from exploration_policies.bayesian import *
-from exploration_policies.boltzmann import *
-from exploration_policies.bootstrapped import *
-from exploration_policies.categorical import *
-from exploration_policies.continuous_entropy import *
-from exploration_policies.e_greedy import *
-from exploration_policies.exploration_policy import *
-from exploration_policies.greedy import *
-from exploration_policies.ou_process import *
-from exploration_policies.thompson_sampling import *

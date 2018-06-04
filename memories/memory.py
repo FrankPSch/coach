@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2017 Intel Corporation 
+# Copyright (c) 2017 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,32 +15,54 @@
 #
 
 import numpy as np
-import copy
-from configurations import *
+from typing import Tuple
+from enum import Enum
+from configurations import Parameters
+
+
+class MemoryGranularity(Enum):
+    Transitions = 0
+    Episodes = 1
+
+
+class MemoryParameters(Parameters):
+    def __init__(self):
+        super().__init__()
+        self.max_size = None
+        self.distributed_memory = False
+        self.load_memory_from_file_path = None
+
+
+    @property
+    def path(self):
+        return 'memories.memory:Memory'
 
 
 class Memory(object):
-    def __init__(self, tuning_parameters):
+    def __init__(self, max_size: Tuple[MemoryGranularity, int]):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param max_size: the maximum number of objects to hold in the memory
         """
-        pass
+        self.max_size = max_size
+        self._length = 0
 
     def store(self, obj):
-        pass
+        raise NotImplementedError("")
 
     def get(self, index):
-        pass
+        raise NotImplementedError("")
+
+    def remove(self, index):
+        raise NotImplementedError("")
 
     def length(self):
-        pass
+        raise NotImplementedError("")
 
     def sample(self, size):
-        pass
+        raise NotImplementedError("")
 
     def clean(self):
-        pass
+        raise NotImplementedError("")
 
 
 class Episode(object):
@@ -81,17 +103,17 @@ class Episode(object):
             current_discount *= discount
 
         # calculate the bootstrapped returns
-        bootstraps = np.array([np.squeeze(t.info['max_action_value']) for t in self.transitions[n_step_return:]])
-        bootstrapped_return = total_return + current_discount * np.pad(bootstraps, (0, n_step_return), 'constant',
-                                                                       constant_values=0)
         if is_bootstrapped:
+            bootstraps = np.array([np.squeeze(t.info['max_action_value']) for t in self.transitions[n_step_return:]])
+            bootstrapped_return = total_return + current_discount * np.pad(bootstraps, (0, n_step_return), 'constant',
+                                                                           constant_values=0)
             total_return = bootstrapped_return
 
         for transition_idx in range(self.length()):
             self.transitions[transition_idx].total_return = total_return[transition_idx]
 
     def update_measurements_targets(self, num_steps):
-        if 'measurements' not in self.transitions[0].state:
+        if 'measurements' not in self.transitions[0].state or self.transitions[0].state['measurements'] == []:
             return
         measurements_size = self.transitions[0].state['measurements'].shape[-1]
         total_return = sum([transition.reward for transition in self.transitions])
@@ -120,8 +142,10 @@ class Episode(object):
         return self.get_transitions_attribute('total_return')
 
     def get_transitions_attribute(self, attribute_name):
-        if hasattr(self.transitions[0], attribute_name):
-            return [t.__dict__[attribute_name] for t in self.transitions]
+        if len(self.transitions) > 0 and hasattr(self.transitions[0], attribute_name):
+            return [getattr(t, attribute_name) for t in self.transitions]
+        elif len(self.transitions) == 0:
+            return []
         else:
             raise ValueError("The transitions have no such attribute name")
 
@@ -130,32 +154,3 @@ class Episode(object):
         for i in range(self.length()):
             batch.append(self.get_transition(i))
         return batch
-
-
-class Transition(object):
-    def __init__(self, state, action, reward=0, next_state=None, game_over=False):
-        """
-        A transition is a tuple containing the information of a single step of interaction
-        between the agent and the environment. The most basic version should contain the following values:
-        (current state, action, reward, next state, game over)
-        For imitation learning algorithms, if the reward, next state or game over is not known,
-        it is sufficient to store the current state and action taken by the expert.
-
-        :param state: The current state. Assumed to be a dictionary where the observation
-                      is located at state['observation']
-        :param action: The current action that was taken
-        :param reward: The reward received from the environment
-        :param next_state: The next state of the environment after applying the action.
-                           The next state should be similar to the state in its structure.
-        :param game_over: A boolean which should be True if the episode terminated after
-                          the execution of the action.
-        """
-        self.state = state
-        self.action = action
-        self.reward = reward
-        self.total_return = None
-        if not next_state:
-            next_state = state
-        self.next_state = next_state
-        self.game_over = game_over
-        self.info = {}

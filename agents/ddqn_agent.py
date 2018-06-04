@@ -13,30 +13,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import Union
 
-from agents.value_optimization_agent import *
+from agents.value_optimization_agent import ValueOptimizationAgent
+import numpy as np
+from agents.dqn_agent import DQNAgentParameters
+from schedules import LinearSchedule
+from core_types import EnvironmentSteps
+
+
+class DDQNAgentParameters(DQNAgentParameters):
+    def __init__(self):
+        super().__init__()
+        self.algorithm.num_steps_between_copying_online_weights_to_target = EnvironmentSteps(30000)
+        self.exploration.epsilon_schedule = LinearSchedule(1, 0.01, 1000000)
+        self.exploration.evaluation_epsilon = 0.001
+
+    @property
+    def path(self):
+        return 'agents.ddqn_agent:DDQNAgent'
 
 
 # Double DQN - https://arxiv.org/abs/1509.06461
 class DDQNAgent(ValueOptimizationAgent):
-    def __init__(self, env, tuning_parameters, replicated_device=None, thread_id=0):
-        ValueOptimizationAgent.__init__(self, env, tuning_parameters, replicated_device, thread_id)
+    def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
+        super().__init__(agent_parameters, parent)
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch)
+        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
 
-        selected_actions = np.argmax(self.main_network.online_network.predict(next_states), 1)
-        q_st_plus_1 = self.main_network.target_network.predict(next_states)
-        TD_targets = self.main_network.online_network.predict(current_states)
+        selected_actions = np.argmax(self.networks['main'].online_network.predict(next_states), 1)
+        q_st_plus_1 = self.networks['main'].target_network.predict(next_states)
+        TD_targets = self.networks['main'].online_network.predict(current_states)
 
         # initialize with the current prediction so that we will
         #  only update the action that we have actually done in this transition
-        for i in range(self.tp.batch_size):
-            TD_targets[i, actions[i]] = rewards[i] \
-                                        + (1.0 - game_overs[i]) * self.tp.agent.discount * q_st_plus_1[i][
-                selected_actions[i]]
+        TD_errors = []
+        for i in range(self.ap.network_wrappers['main'].batch_size):
+            new_target = rewards[i] + (1.0 - game_overs[i]) * self.ap.algorithm.discount * q_st_plus_1[i][selected_actions[i]]
+            TD_errors.append(np.abs(new_target - TD_targets[i, actions[i]]))
+            TD_targets[i, actions[i]] = new_target
 
-        result = self.main_network.train_and_sync_networks(current_states, TD_targets)
-        total_loss = result[0]
+        # update errors in prioritized replay buffer
+        importance_weights = self.update_transition_priorities_and_get_weights(TD_errors, batch)
 
-        return total_loss
+        result = self.networks['main'].train_and_sync_networks(current_states, TD_targets,
+                                                               importance_weights=importance_weights)
+        total_loss, losses, unclipped_grads = result[:3]
+
+        return total_loss, losses, unclipped_grads

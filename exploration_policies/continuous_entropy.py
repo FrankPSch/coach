@@ -14,9 +14,14 @@
 # limitations under the License.
 #
 
-import numpy as np
-from exploration_policies.exploration_policy import *
+from exploration_policies.additive_noise import AdditiveNoise, AdditiveNoiseParameters
 
 
-class ContinuousEntropy(ExplorationPolicy):
+class ContinuousEntropyParameters(AdditiveNoiseParameters):
+    @property
+    def path(self):
+        return 'exploration_policies.continuous_entropy:ContinuousEntropy'
+
+
+class ContinuousEntropy(AdditiveNoise):
     pass

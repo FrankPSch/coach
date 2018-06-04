@@ -52,7 +52,7 @@ TEMP=`getopt -o cpgvrmeNndh \
              -- "$@"`
 eval set -- "$TEMP"
 while true; do
-#for i in "$@"
+# for i in "$@"
     case ${1} in
         -c|--coach)
             INSTALL_COACH=1
@@ -148,16 +148,6 @@ if [ ${INSTALL_DASHBOARD} -eq 1 ]; then
     pip3 install -r ./requirements_dashboard.txt
     sudo -E apt-get install dpkg-dev build-essential python3.5-dev libjpeg-dev  libtiff-dev libsdl1.2-dev libnotify-dev \
     freeglut3 freeglut3-dev libsm-dev libgtk2.0-dev libgtk-3-dev libwebkitgtk-dev libgtk-3-dev libwebkitgtk-3.0-dev libgstreamer-plugins-base1.0-dev -y
-
-    sudo -E -H pip3 install -U --pre -f \
-    https://wxpython.org/Phoenix/snapshot-builds/linux/gtk3/ubuntu-16.04/wxPython-4.0.0a3.dev3059+4a5c5d9-cp35-cp35m-linux_x86_64.whl  wxPython
-
-    # link wxPython Phoenix library into the virtualenv since it is installed with apt-get and not accessible
-    libs=( wx )
-    for lib in ${libs[@]}
-    do
-        ln -sf $lib_system_path/$lib $lib_virtualenv_path/$lib
-    done
 fi
 
 # Gym
@@ -165,7 +155,7 @@ if [ ${INSTALL_GYM} -eq 1 ]; then
     echo "Installing Gym support"
     sudo -E apt-get install libav-tools libsdl2-dev swig cmake -y
     pip3 install box2d # for bipedal walker etc.
-    pip3 install gym[all]==0.9.4
+    pip3 install gym==0.9.4
 fi
 
 # NGraph and Neon

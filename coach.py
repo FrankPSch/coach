@@ -14,49 +14,89 @@
 # limitations under the License.
 #
 
-import sys, inspect, re
+import sys
+
+from agents.human_agent import HumanAgentParameters
+from block_factories.basic_rl_factory import BasicRLFactory
+from core_types import TrainingSteps, Episodes, EnvironmentSteps
+from environments.environment import EnvironmentParameters, SingleLevelSelection
+
+sys.path.append('.')
+import re
 import os
 import json
-import presets
-from presets import *
-from utils import set_gpu, list_all_classes_in_module
-from architectures import *
-from environments import *
-from agents import *
-from utils import *
-from logger import screen, logger
+import logger
+from logger import screen, failed_imports
 import argparse
-from subprocess import Popen
-import datetime
-import presets
 import atexit
 import sys
+from configurations import Frameworks, VisualizationParameters
+from multiprocessing import Process
+from multiprocessing.managers import BaseManager
 import subprocess
-from threading import Thread
+from block_scheduler import start_block, HumanPlayBlockSchedulerParameters
+from block_factories.block_factory import TaskParameters, DistributedTaskParameters
+from utils import list_all_presets, short_dynamic_import, get_open_port, SharedMemoryScratchPad
+
 
 if len(set(failed_imports)) > 0:
     screen.warning("Warning: failed to import the following packages - {}".format(', '.join(set(failed_imports))))
 
 
-def set_framework(framework_type):
-    # choosing neural network framework
-    framework = Frameworks().get(framework_type)
-    sess = None
-    if framework == Frameworks.TensorFlow:
-        import tensorflow as tf
-        config = tf.ConfigProto()
-        config.allow_soft_placement = True
-        config.gpu_options.allow_growth = True
-        config.gpu_options.per_process_gpu_memory_fraction = 0.2
-        sess = tf.Session(config=config)
-    elif framework == Frameworks.Neon:
-        import ngraph as ng
-        sess = ng.transformers.make_transformer()
-    screen.log_title("Using {} framework".format(Frameworks().to_string(framework)))
-    return sess
+def get_block_factory_from_args(args: argparse.Namespace) -> 'BlockFactory':
+    """
+    Return the block factory according to the command line arguments given by the user
+    :param args: the arguments given by the user
+    :return: the updated block factory
+    """
+
+    block_factory = None
+
+    # if a preset was given we will load the factory for the preset
+    if args.preset is not None:
+        block_factory = short_dynamic_import(args.preset, ignore_module_case=True)
+
+    # for human play we need to create a custom block factory
+    if args.play:
+        env_params = short_dynamic_import(args.environment_type, ignore_module_case=True)()
+        env_params.human_control = True
+        schedule_params = HumanPlayBlockSchedulerParameters()
+        block_factory = BasicRLFactory(HumanAgentParameters(), env_params, schedule_params, VisualizationParameters())
+
+    if args.level:
+        if isinstance(block_factory.env_params.level, SingleLevelSelection):
+            block_factory.env_params.level.select(args.level)
+        else:
+            block_factory.env_params.level = args.level
+
+    # set the seed for the environment
+    if args.seed:
+        block_factory.env_params.seed = args.seed
+
+    # visualization
+    block_factory.vis_params.dump_gifs = args.dump_gifs
+    block_factory.vis_params.render = args.render
+    block_factory.vis_params.tensorboard = args.tensorboard
+
+    # update the custom parameters
+    if args.custom_parameter is not None:
+        unstripped_key_value_pairs = [pair.split('=') for pair in args.custom_parameter.split(';')]
+        stripped_key_value_pairs = [tuple([pair[0].strip(), pair[1].strip()]) for pair in
+                                    unstripped_key_value_pairs if len(pair) == 2]
+
+        # load custom parameters into run_dict
+        for key, value in stripped_key_value_pairs:
+            exec("block_factory.{}={}".format(key, value))
+
+    return block_factory
 
 
-def check_input_and_fill_run_dict(parser):
+def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    """
+    Parse the arguments that the user entered
+    :param parser: the argparse command line parser
+    :return: the parsed arguments
+    """
     args = parser.parse_args()
 
     # if no arg is given
@@ -65,94 +105,72 @@ def check_input_and_fill_run_dict(parser):
         exit(0)
 
     # list available presets
+    preset_names = list_all_presets()
     if args.list:
-        presets_lists = list_all_classes_in_module(presets)
         screen.log_title("Available Presets:")
-        for preset in presets_lists:
+        for preset in preset_names:
             print(preset)
         sys.exit(0)
 
-    # check inputs
-    try:
-        # num_workers = int(args.num_workers)
-        num_workers = int(re.match("^\d+$", args.num_workers).group(0))
-    except ValueError:
-        screen.error("Parameter num_workers should be an integer.")
+    # replace a short preset name with the full path
+    if args.preset is not None:
+        if args.preset.lower() in [p.lower() for p in preset_names]:
+            args.preset = "presets.{}:factory".format(args.preset)
 
-    preset_names = list_all_classes_in_module(presets)
-    if args.preset is not None and args.preset not in preset_names:
-        screen.error("A non-existing preset was selected. ")
+        # verify that the preset exists
+        preset_path = args.preset.split(":")[0].replace('.', '/') + ".py"
+        if not os.path.exists(preset_path):
+            screen.error("The given preset ({}) cannot be found.".format(args.preset))
 
-    if args.checkpoint_restore_dir is not None and not os.path.exists(args.checkpoint_restore_dir):
-        screen.error("The requested checkpoint folder to load from does not exist. ")
-
-    if args.save_model_sec is not None:
+        # verify that the preset can be instantiated
         try:
-            args.save_model_sec = int(args.save_model_sec)
-        except ValueError:
-            screen.error("Parameter save_model_sec should be an integer.")
+            short_dynamic_import(args.preset, ignore_module_case=True)
+        except TypeError as e:
+            screen.error('Internal Error: ' + str(e) + "\n\nThe given preset ({}) cannot be instantiated."
+                         .format(args.preset))
 
-    if args.preset is None and (args.agent_type is None or args.environment_type is None
-                                       or args.exploration_policy_type is None) and not args.play:
-        screen.error('When no preset is given for Coach to run, the user is expected to input the desired agent_type,'
-                     ' environment_type and exploration_policy_type to assemble a preset. '
-                     '\nAt least one of these parameters was not given.')
-    elif args.preset is None and args.play and args.environment_type is None:
-        screen.error('When no preset is given for Coach to run, and the user requests human control over the environment,'
-                     ' the user is expected to input the desired environment_type and level.'
-                     '\nAt least one of these parameters was not given.')
-    elif args.preset is None and args.play and args.environment_type:
-        args.agent_type = 'Human'
-        args.exploration_policy_type = 'ExplorationParameters'
+    # validate the checkpoints args
+    if args.checkpoint_restore_dir is not None and not os.path.exists(args.checkpoint_restore_dir):
+        screen.error("The requested checkpoint folder to load from does not exist.")
+
+    # no preset was given. check if the user requested to play some environment on its own
+    if args.preset is None and args.play:
+        if args.environment_type:
+            args.agent_type = 'Human'
+        else:
+            screen.error('When no preset is given for Coach to run, and the user requests human control over '
+                         'the environment, the user is expected to input the desired environment_type and level.'
+                         '\nAt least one of these parameters was not given.')
+    elif args.preset and args.play:
+        screen.error("Both the --preset and the --play flags were set. These flags can not be used together. "
+                     "For human control, please use the --play flag together with the environment type flag (-et)")
+    elif args.preset is None and not args.play:
+        screen.error("Please choose a preset using the -p flag or use the --play flag together with choosing an "
+                     "environment type (-et) in order to play the game.")
 
     # get experiment name and path
-    experiment_name = logger.get_experiment_name(args.experiment_name)
-    experiment_path = logger.get_experiment_path(experiment_name)
+    args.experiment_name = logger.get_experiment_name(args.experiment_name)
+    args.experiment_path = logger.get_experiment_path(args.experiment_name)
 
-    if args.play and num_workers > 1:
+    if args.play and args.num_workers > 1:
         screen.warning("Playing the game as a human is only available with a single worker. "
                        "The number of workers will be reduced to 1")
-        num_workers = 1
+        args.num_workers = 1
 
-    # fill run_dict
-    run_dict = dict()
-    run_dict['agent_type'] = args.agent_type
-    run_dict['environment_type'] = args.environment_type
-    run_dict['exploration_policy_type'] = args.exploration_policy_type
-    run_dict['level'] = args.level
-    run_dict['preset'] = args.preset
-    run_dict['custom_parameter'] = args.custom_parameter
-    run_dict['experiment_path'] = experiment_path
-    run_dict['framework'] = Frameworks().get(args.framework)
-    run_dict['play'] = args.play
-    run_dict['evaluate'] = args.evaluate# or args.play
-
-    # multi-threading parameters
-    run_dict['num_threads'] = num_workers
+    args.framework = Frameworks().get(args.framework)
 
     # checkpoints
-    run_dict['save_model_sec'] = args.save_model_sec
-    run_dict['save_model_dir'] = experiment_path if args.save_model_sec is not None else None
-    run_dict['checkpoint_restore_dir'] = args.checkpoint_restore_dir
+    args.save_model_dir = args.experiment_path if args.save_model_sec is not None else None
 
-    # visualization
-    run_dict['visualization.dump_gifs'] = args.dump_gifs
-    run_dict['visualization.render'] = args.render
-    run_dict['visualization.tensorboard'] = args.tensorboard
-
-    return args, run_dict
+    return args
 
 
-def run_dict_to_json(_run_dict, task_id=''):
-    if task_id != '':
-        json_path = os.path.join(_run_dict['experiment_path'], 'run_dict_worker{}.json'.format(task_id))
-    else:
-        json_path = os.path.join(_run_dict['experiment_path'], 'run_dict.json')
-
-    with open(json_path, 'w') as outfile:
-        json.dump(_run_dict, outfile, indent=2)
-
-    return json_path
+def open_dashboard(experiment_path):
+    dashboard_path = 'python dashboard.py'
+    cmd = "{} --experiment_dir {}".format(dashboard_path, experiment_path)
+    screen.log_title("Opening dashboard - experiment path: {}".format(experiment_path))
+    # subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True, executable="/bin/bash")
+    subprocess.Popen(cmd, shell=True, executable="/bin/bash")
 
 
 if __name__ == "__main__":
@@ -177,8 +195,8 @@ if __name__ == "__main__":
                         type=str)
     parser.add_argument('-n', '--num_workers',
                         help="(int) Number of workers for multi-process based agents, e.g. A3C",
-                        default='1',
-                        type=str)
+                        default=1,
+                        type=int)
     parser.add_argument('--play',
                         help="(flag) Play as a human by controlling the game with the keyboard. "
                              "This option will save a replay buffer with the game play.",
@@ -243,91 +261,93 @@ if __name__ == "__main__":
     parser.add_argument('-ns', '--no_summary',
                         help="(flag) Prevent Coach from printing a summary and asking questions at the end of runs",
                         action='store_true')
+    parser.add_argument('-d', '--open_dashboard',
+                        help="(flag) Open dashboard with the experiment when the run starts",
+                        action='store_true')
+    parser.add_argument('--seed',
+                        help="(int) A seed to use for running the experiment",
+                        default=None,
+                        type=int)
 
-    args, run_dict = check_input_and_fill_run_dict(parser)
+    args = parse_arguments(parser)
+
+    block_factory = get_block_factory_from_args(args)
 
     # turn TF debug prints off
     if not args.verbose and args.framework.lower() == 'tensorflow':
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-    # dump documentation
-    logger.set_dump_dir(run_dict['experiment_path'], add_timestamp=True)
+    # turn off the summary at the end of the run if necessary
     if not args.no_summary:
         atexit.register(logger.summarize_experiment)
-        screen.change_terminal_title(logger.experiment_name)
+        screen.change_terminal_title(args.experiment_name)
+
+    # open dashboard
+    if args.open_dashboard:
+        open_dashboard(args.experiment_path)
 
     # Single-threaded runs
-    if run_dict['num_threads'] == 1:
-        # set tuning parameters
-        json_run_dict_path = run_dict_to_json(run_dict)
-        tuning_parameters = json_to_preset(json_run_dict_path)
-        tuning_parameters.sess = set_framework(args.framework)
-
-        if args.print_parameters:
-            print('tuning_parameters', tuning_parameters)
-
-        # Single-thread runs
-        tuning_parameters.task_index = 0
-        env_instance = create_environment(tuning_parameters)
-        agent = eval(tuning_parameters.agent.type + '(env_instance, tuning_parameters)')
-
+    if args.num_workers == 1:
         # Start the training or evaluation
-        if tuning_parameters.evaluate:
-            agent.evaluate(sys.maxsize, keep_networks_synced=True)  # evaluate forever
-        else:
-            agent.improve()
+        task_parameters = TaskParameters(framework_type="tensorflow",  # TODO: tensorflow should'nt be hardcoded
+                                         evaluate_only=args.evaluate,
+                                         experiment_path=args.experiment_path,
+                                         seed=args.seed)
+        task_parameters.__dict__.update(args.__dict__)
+
+        start_block(block_factory=block_factory, task_parameters=task_parameters)
 
     # Multi-threaded runs
     else:
-        assert args.framework.lower() == 'tensorflow', "Distributed training works only with TensorFlow"
-        os.environ["OMP_NUM_THREADS"]="1"
-        # set parameter server and workers addresses
         ps_hosts = "localhost:{}".format(get_open_port())
-        worker_hosts = ",".join(["localhost:{}".format(get_open_port()) for i in range(run_dict['num_threads'] + 1)])
+        worker_hosts = ",".join(["localhost:{}".format(get_open_port()) for i in range(args.num_workers+1)])
 
-        # Make sure to disable GPU so that all the workers will use the CPU
-        set_cpu()
+        # Shared memory
+        class CommManager(BaseManager):
+            pass
+        CommManager.register('SharedMemoryScratchPad', SharedMemoryScratchPad, exposed=['add', 'get'])
+        comm_manager = CommManager()
+        comm_manager.start()
+        shared_memory_scratchpad = comm_manager.SharedMemoryScratchPad()
 
-        # create a parameter server
-        cmd = [
-            "python3",
-           "./parallel_actor.py",
-           "--ps_hosts={}".format(ps_hosts),
-           "--worker_hosts={}".format(worker_hosts),
-           "--job_name=ps",
-        ]
-        parameter_server = Popen(cmd)
+        def start_distributed_task(job_type, task_index, evaluation_worker=False, use_cpu=True,
+                                   shared_memory_scratchpad=shared_memory_scratchpad):
+            # TODO: the use_cpu flag does not work correctly yet
+            task_parameters = DistributedTaskParameters(framework_type="tensorflow", # TODO: tensorflow should'nt be hardcoded
+                                                        parameters_server_hosts=ps_hosts,
+                                                        worker_hosts=worker_hosts,
+                                                        job_type=job_type,
+                                                        task_index=task_index,
+                                                        evaluate_only=evaluation_worker,
+                                                        use_cpu=use_cpu,
+                                                        num_tasks=args.num_workers+1,  # training tasks + 1 evaluation task
+                                                        num_training_tasks=args.num_workers,
+                                                        experiment_path=args.experiment_path,
+                                                        shared_memory_scratchpad=shared_memory_scratchpad,
+                                                        seed=args.seed+task_index)  # each worker gets a different seed
+            task_parameters.__dict__.update(args.__dict__)
+            # we assume that only the evaluation workers are rendering
+            block_factory.vis_params.render = args.render and evaluation_worker
+            p = Process(target=start_block, args=(block_factory, task_parameters))
+            # TODO - should the processes be defined as daemons? This cause an issue with setting a distributed DND
+            # through the scratchpad. Currently we do not add the DND to the scratchpad see (dnd_q_head for more info
+            # on that), so we do not care about it being set to True.
 
-        screen.log_title("*** Distributed Training ***")
-        time.sleep(1)
+            p.daemon = True
+            p.start()
+            return p
 
-        # create N training workers and 1 evaluating worker
+        # parameter server
+        parameter_server = start_distributed_task("ps", 0)
+
+        # training workers
         workers = []
+        for task_index in range(args.num_workers):
+            workers.append(start_distributed_task("worker", task_index))
 
-        for i in range(run_dict['num_threads'] + 1):
-            # this is the evaluation worker
-            run_dict['task_id'] = i
-            if i == run_dict['num_threads']:
-                run_dict['evaluate_only'] = True
-                run_dict['visualization.render'] = args.render
-            else:
-                run_dict['evaluate_only'] = False
-                run_dict['visualization.render'] = False  # #In a parallel setting, only the evaluation agent renders
-
-            json_run_dict_path = run_dict_to_json(run_dict, i)
-            workers_args = ["python3", "./parallel_actor.py",
-                            "--ps_hosts={}".format(ps_hosts),
-                            "--worker_hosts={}".format(worker_hosts),
-                            "--job_name=worker",
-                            "--load_json={}".format(json_run_dict_path)]
-
-            p = Popen(workers_args)
-
-            if i != run_dict['num_threads']:
-                workers.append(p)
-            else:
-                evaluation_worker = p
+        # evaluation worker
+        evaluation_worker = start_distributed_task("worker", args.num_workers, evaluation_worker=True)
 
         # wait for all workers
-        [w.wait() for w in workers]
-        evaluation_worker.kill()
+        [w.join() for w in workers]
+        evaluation_worker.terminate()

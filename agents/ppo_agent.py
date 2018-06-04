@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2017 Intel Corporation
+# Copyright (c) 2017 Intel Corporation 
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,47 +13,102 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import Union
 
-from agents.actor_critic_agent import *
-from random import shuffle
+from agents.policy_optimization_agent import PolicyGradientRescaler
+from agents.actor_critic_agent import ActorCriticAgent
+from block_factories.block_factory import DistributedTaskParameters
+from utils import Signal, force_list, eps
+from configurations import InputTypes, OutputTypes, AlgorithmParameters, NetworkParameters, MiddlewareTypes, \
+    AgentParameters, InputEmbedderParameters
+from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
+from architectures.network_wrapper import NetworkWrapper
+from exploration_policies.additive_noise import AdditiveNoiseParameters
+import numpy as np
+from logger import screen
+from core_types import RunPhase, ActionInfo, EnvironmentSteps
+from collections import OrderedDict
+from spaces import Discrete, Box
+import copy
+
+
+class PPOCriticNetworkParameters(NetworkParameters):
+    def __init__(self):
+        super().__init__()
+        self.input_types = {'observation': InputEmbedderParameters()}
+        self.middleware_type = MiddlewareTypes.FC
+        self.output_types = [OutputTypes.V]
+        self.loss_weights = [1.0]
+        self.hidden_layers_activation_function = 'tanh'
+        self.async_training = True
+        self.l2_regularization = 0
+        self.create_target_network = True
+        self.batch_size = 128
+
+
+class PPOActorNetworkParameters(NetworkParameters):
+    def __init__(self):
+        super().__init__()
+        self.input_types = {'observation': InputEmbedderParameters()}
+        self.middleware_type = MiddlewareTypes.FC
+        self.output_types = [OutputTypes.PPO]
+        self.optimizer_type = 'Adam'
+        self.loss_weights = [1.0]
+        self.hidden_layers_activation_function = 'tanh'
+        self.async_training = True
+        self.l2_regularization = 0
+        self.create_target_network = True
+        self.batch_size = 128
+
+
+class PPOAlgorithmParameters(AlgorithmParameters):
+    def __init__(self):
+        super().__init__()
+        self.policy_gradient_rescaler = PolicyGradientRescaler.GAE
+        self.gae_lambda = 0.96
+        self.target_kl_divergence = 0.01
+        self.initial_kl_coefficient = 1.0
+        self.high_kl_penalty_coefficient = 1000
+        self.add_a_normalized_timestep_to_the_observation = False
+        self.clip_likelihood_ratio_using_epsilon = None
+        self.value_targets_mix_fraction = 0.1
+        self.estimate_state_value_using_gae = True
+        self.step_until_collecting_full_episodes = True
+        self.use_kl_regularization = True
+        self.beta_entropy = 0.01
+        self.num_consecutive_playing_steps = EnvironmentSteps(5000)
+
+
+class PPOAgentParameters(AgentParameters):
+    def __init__(self):
+        super().__init__(algorithm=PPOAlgorithmParameters(),
+                         exploration=AdditiveNoiseParameters(),
+                         memory=EpisodicExperienceReplayParameters(),
+                         networks={"critic": PPOCriticNetworkParameters(), "actor": PPOActorNetworkParameters()})
+
+    @property
+    def path(self):
+        return 'agents.ppo_agent:PPOAgent'
 
 
 # Proximal Policy Optimization - https://arxiv.org/pdf/1707.06347.pdf
 class PPOAgent(ActorCriticAgent):
-    def __init__(self, env, tuning_parameters, replicated_device=None, thread_id=0):
-        ActorCriticAgent.__init__(self, env, tuning_parameters, replicated_device, thread_id,
-                                  create_target_network=True)
-        self.critic_network = self.main_network
-
-        # define the policy network
-        tuning_parameters.agent.input_types = {'observation': InputTypes.Observation}
-        tuning_parameters.agent.output_types = [OutputTypes.PPO]
-        tuning_parameters.agent.optimizer_type = 'Adam'
-        tuning_parameters.agent.l2_regularization = 0
-        self.policy_network = NetworkWrapper(tuning_parameters, True, self.has_global, 'policy',
-                                             self.replicated_device, self.worker_device)
-        self.networks.append(self.policy_network)
-
+    def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
+        super().__init__(agent_parameters, parent)
         # signals definition
-        self.value_loss = Signal('Value Loss')
-        self.signals.append(self.value_loss)
-        self.policy_loss = Signal('Policy Loss')
-        self.signals.append(self.policy_loss)
-        self.kl_divergence = Signal('KL Divergence')
-        self.signals.append(self.kl_divergence)
+        self.value_loss = self.register_signal('Value Loss')
+        self.policy_loss = self.register_signal('Policy Loss')
+        self.kl_divergence = self.register_signal('KL Divergence')
         self.total_kl_divergence_during_training_process = 0.0
-        self.unclipped_grads = Signal('Grads (unclipped)')
-        self.signals.append(self.unclipped_grads)
-
-        self.reset_game(do_not_reset_env=True)
+        self.unclipped_grads = self.register_signal('Grads (unclipped)')
 
     def fill_advantages(self, batch):
-        current_states, next_states, actions, rewards, game_overs, total_return = self.extract_batch(batch)
+        current_states, next_states, actions, rewards, game_overs, total_return = self.extract_batch(batch, "critic")
 
         # * Found not to have any impact *
         # current_states_with_timestep = self.concat_state_and_timestep(batch)
 
-        current_state_values = self.critic_network.online_network.predict(current_states).squeeze()
+        current_state_values = self.networks['critic'].online_network.predict(current_states).squeeze()
 
         # calculate advantages
         advantages = []
@@ -88,18 +143,18 @@ class PPOAgent(ActorCriticAgent):
 
     def train_value_network(self, dataset, epochs):
         loss = []
-        current_states, _, _, _, _, total_return = self.extract_batch(dataset)
+        current_states, _, _, _, _, total_return = self.extract_batch(dataset, 'critic')
 
         # * Found not to have any impact *
         # add a timestep to the observation
         # current_states_with_timestep = self.concat_state_and_timestep(dataset)
 
         total_return = np.expand_dims(total_return, -1)
-        mix_fraction = self.tp.agent.value_targets_mix_fraction
+        mix_fraction = self.ap.algorithm.value_targets_mix_fraction
         for j in range(epochs):
             batch_size = len(dataset)
-            if self.critic_network.online_network.optimizer_type != 'LBFGS':
-                batch_size = self.tp.batch_size
+            if self.networks['critic'].online_network.optimizer_type != 'LBFGS':
+                batch_size = self.ap.network_wrappers['critic'].batch_size
             for i in range(len(dataset) // batch_size):
                 # split to batches for first order optimization techniques
                 current_states_batch = {
@@ -107,25 +162,26 @@ class PPOAgent(ActorCriticAgent):
                     for k, v in current_states.items()
                 }
                 total_return_batch = total_return[i * batch_size:(i + 1) * batch_size]
-                old_policy_values = force_list(self.critic_network.target_network.predict(
+                old_policy_values = force_list(self.networks['critic'].target_network.predict(
                     current_states_batch).squeeze())
-                if self.critic_network.online_network.optimizer_type != 'LBFGS':
+                if self.networks['critic'].online_network.optimizer_type != 'LBFGS':
                     targets = total_return_batch
                 else:
-                    current_values = self.critic_network.online_network.predict(current_states_batch)
+                    current_values = self.networks['critic'].online_network.predict(current_states_batch)
                     targets = current_values * (1 - mix_fraction) + total_return_batch * mix_fraction
 
                 inputs = copy.copy(current_states_batch)
                 for input_index, input in enumerate(old_policy_values):
                     name = 'output_0_{}'.format(input_index)
-                    if name in self.critic_network.online_network.inputs:
+                    if name in self.networks['critic'].online_network.inputs:
                         inputs[name] = input
 
-                value_loss = self.critic_network.online_network.accumulate_gradients(inputs, targets)
-                self.critic_network.apply_gradients_to_online_network()
-                if self.tp.distributed:
-                    self.critic_network.apply_gradients_to_global_network()
-                self.critic_network.online_network.reset_accumulated_gradients()
+                value_loss = self.networks['critic'].online_network.accumulate_gradients(inputs, targets)
+
+                self.networks['critic'].apply_gradients_to_online_network()
+                if isinstance(self.ap.task_parameters, DistributedTaskParameters):
+                    self.networks['critic'].apply_gradients_to_global_network()
+                self.networks['critic'].online_network.reset_accumulated_gradients()
 
                 loss.append([value_loss[0]])
         loss = np.mean(loss, 0)
@@ -147,19 +203,19 @@ class PPOAgent(ActorCriticAgent):
                 'fetch_result': []
             }
             #shuffle(dataset)
-            for i in range(len(dataset) // self.tp.batch_size):
-                batch = dataset[i * self.tp.batch_size:(i + 1) * self.tp.batch_size]
-                current_states, _, actions, _, _, total_return = self.extract_batch(batch)
+            for i in range(len(dataset) // self.ap.network_wrappers['actor'].batch_size):
+                batch = dataset[i * self.ap.network_wrappers['actor'].batch_size:(i + 1) * self.ap.network_wrappers['actor'].batch_size]
+                current_states, _, actions, _, _, total_return = self.extract_batch(batch, 'actor')
                 advantages = np.array([t.info['advantage'] for t in batch])
-                if not self.tp.env_instance.discrete_controls and len(actions.shape) == 1:
+                if not isinstance(self.spaces.action, Discrete) and len(actions.shape) == 1:
                     actions = np.expand_dims(actions, -1)
 
                 # get old policy probabilities and distribution
-                old_policy = force_list(self.policy_network.target_network.predict(current_states))
+                old_policy = force_list(self.networks['actor'].target_network.predict(current_states))
 
                 # calculate gradients and apply on both the local policy network and on the global policy network
-                fetches = [self.policy_network.online_network.output_heads[0].kl_divergence,
-                           self.policy_network.online_network.output_heads[0].entropy]
+                fetches = [self.networks['actor'].online_network.output_heads[0].kl_divergence,
+                           self.networks['actor'].online_network.output_heads[0].entropy]
 
                 inputs = copy.copy(current_states)
                 # TODO: why is this output 0 and not output 1?
@@ -169,15 +225,16 @@ class PPOAgent(ActorCriticAgent):
                 # otherwise, it has both a mean and standard deviation
                 for input_index, input in enumerate(old_policy):
                     inputs['output_0_{}'.format(input_index + 1)] = input
+
                 total_loss, policy_losses, unclipped_grads, fetch_result =\
-                    self.policy_network.online_network.accumulate_gradients(
+                    self.networks['actor'].online_network.accumulate_gradients(
                         inputs, [advantages], additional_fetches=fetches)
 
-                self.policy_network.apply_gradients_to_online_network()
-                if self.tp.distributed:
-                    self.policy_network.apply_gradients_to_global_network()
+                self.networks['actor'].apply_gradients_to_online_network()
+                if isinstance(self.ap.task_parameters, DistributedTaskParameters):
+                    self.networks['actor'].apply_gradients_to_global_network()
 
-                self.policy_network.online_network.reset_accumulated_gradients()
+                self.networks['actor'].online_network.reset_accumulated_gradients()
 
                 loss['total_loss'].append(total_loss)
                 loss['policy_losses'].append(policy_losses)
@@ -189,11 +246,11 @@ class PPOAgent(ActorCriticAgent):
             for key in loss.keys():
                 loss[key] = np.mean(loss[key], 0)
 
-            if self.tp.learning_rate_decay_rate != 0:
-                curr_learning_rate = self.main_network.online_network.get_variable_value(self.tp.learning_rate)
+            if self.ap.network_wrappers['critic'].learning_rate_decay_rate != 0:
+                curr_learning_rate = self.networks['critic'].online_network.get_variable_value(self.ap.learning_rate)
                 self.curr_learning_rate.add_sample(curr_learning_rate)
             else:
-                curr_learning_rate = self.tp.learning_rate
+                curr_learning_rate = self.ap.network_wrappers['critic'].learning_rate
 
             # log training parameters
             screen.log_dict(
@@ -218,9 +275,9 @@ class PPOAgent(ActorCriticAgent):
         screen.log_title("KL = {}".format(self.total_kl_divergence_during_training_process))
 
         # update kl coefficient
-        kl_target = self.tp.agent.target_kl_divergence
-        kl_coefficient = self.policy_network.online_network.get_variable_value(
-            self.policy_network.online_network.output_heads[0].kl_coefficient)
+        kl_target = self.ap.algorithm.target_kl_divergence
+        kl_coefficient = self.networks['actor'].online_network.get_variable_value(
+            self.networks['actor'].online_network.output_heads[0].kl_coefficient)
         new_kl_coefficient = kl_coefficient
         if self.total_kl_divergence_during_training_process > 1.3 * kl_target:
             # kl too high => increase regularization
@@ -231,59 +288,92 @@ class PPOAgent(ActorCriticAgent):
 
         # update the kl coefficient variable
         if kl_coefficient != new_kl_coefficient:
-            self.policy_network.online_network.set_variable_value(
-                self.policy_network.online_network.output_heads[0].assign_kl_coefficient,
+            self.networks['actor'].online_network.set_variable_value(
+                self.networks['actor'].online_network.output_heads[0].assign_kl_coefficient,
                 new_kl_coefficient,
-                self.policy_network.online_network.output_heads[0].kl_coefficient_ph)
+                self.networks['actor'].online_network.output_heads[0].kl_coefficient_ph)
 
         screen.log_title("KL penalty coefficient change = {} -> {}".format(kl_coefficient, new_kl_coefficient))
 
     def post_training_commands(self):
-        if self.tp.agent.use_kl_regularization:
+        if self.ap.algorithm.use_kl_regularization:
             self.update_kl_coefficient()
 
         # clean memory
         self.memory.clean()
 
     def train(self):
-        self.policy_network.sync()
-        self.critic_network.sync()
+        loss = 0
+        if self._should_train(wait_for_full_episode=True):
+            for training_step in range(self.ap.algorithm.num_consecutive_training_steps):
+                self.networks['actor'].sync()
+                self.networks['critic'].sync()
 
-        dataset = self.memory.transitions
+                dataset = self.memory.transitions
 
-        self.fill_advantages(dataset)
+                self.fill_advantages(dataset)
 
-        # take only the requested number of steps
-        dataset = dataset[:self.tp.agent.num_consecutive_playing_steps]
+                # take only the requested number of steps
+                dataset = dataset[:self.ap.algorithm.num_consecutive_playing_steps.num_steps]
 
-        value_loss = self.train_value_network(dataset, 1)
-        policy_loss = self.train_policy_network(dataset, 10)
+                value_loss = self.train_value_network(dataset, 1)
+                policy_loss = self.train_policy_network(dataset, 10)
 
-        self.value_loss.add_sample(value_loss)
-        self.policy_loss.add_sample(policy_loss)
-        self.update_log()  # should be done in order to update the data that has been accumulated * while not playing *
-        return np.append(value_loss, policy_loss)
+                self.value_loss.add_sample(value_loss)
+                self.policy_loss.add_sample(policy_loss)
 
-    def choose_action(self, curr_state, phase=RunPhase.TRAIN):
-        if self.env.discrete_controls:
+            self.training_iteration += 1
+            self.update_log()  # should be done in order to update the data that has been accumulated * while not playing *
+            return np.append(value_loss, policy_loss)
+
+    # def choose_action(self, curr_state):
+    #     # TODO: shouldn't this be inherited?
+    #     # convert to batch so we can run it through the network
+    #     tf_input_state = self.dict_state_to_batches_dict(curr_state, 'actor')
+    #     if isinstance(self.spaces.action, Discrete):
+    #         # DISCRETE
+    #         action_values = self.networks['actor'].online_network.predict(tf_input_state).squeeze()
+    #
+    #         action = self.exploration_policy.get_action(action_values)
+    #         action_info = ActionInfo(action=action, action_probability=action_values[action])
+    #     elif isinstance(self.spaces.action, Box):
+    #         # CONTINUOUS
+    #         action_values_mean, action_values_std = self.networks['actor'].online_network.predict(tf_input_state)
+    #         action_values_mean = action_values_mean.squeeze()
+    #         action_values_std = action_values_std.squeeze()
+    #         # TODO: rewrite this using exploration policies
+    #         if self._phase == RunPhase.TRAIN:
+    #             action = np.squeeze(np.random.randn(self.spaces.action.shape) * action_values_std + action_values_mean)
+    #         else:
+    #             action = action_values_mean
+    #         action_info = ActionInfo(action=action, action_probability=action_values_mean)
+    #     else:
+    #         raise ValueError("The action space of the environment is not compatible with the algorithm")
+    #
+    #     return action_info
+
+    def choose_action(self, curr_state):
+        # TODO: shouldn't this be inherited?
+        # convert to batch so we can run it through the network
+        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'actor')
+        if isinstance(self.spaces.action, Discrete):
             # DISCRETE
-            action_values = self.policy_network.online_network.predict(self.tf_input_state(curr_state)).squeeze()
+            action_probabilities = self.networks['actor'].online_network.predict(tf_input_state)
 
-            if phase == RunPhase.TRAIN:
-                action = self.exploration_policy.get_action(action_values)
-            else:
-                action = np.argmax(action_values)
-            action_info = {"action_probability": action_values[action]}
-            # self.entropy.add_sample(-np.sum(action_values * np.log(action_values)))
-        else:
+            action_probabilities = action_probabilities.squeeze()
+            action = self.exploration_policy.get_action(action_probabilities)
+            action_info = ActionInfo(action=action,
+                                     action_probability=action_probabilities[action])
+
+            self.entropy.add_sample(-np.sum(action_probabilities * np.log(action_probabilities + eps)))
+        elif isinstance(self.spaces.action, Box):
             # CONTINUOUS
-            action_values_mean, action_values_std = self.policy_network.online_network.predict(self.tf_input_state(curr_state))
-            action_values_mean = action_values_mean.squeeze()
-            action_values_std = action_values_std.squeeze()
-            if phase == RunPhase.TRAIN:
-                action = np.squeeze(np.random.randn(1, self.action_space_size) * action_values_std + action_values_mean)
-            else:
-                action = action_values_mean
-            action_info = {"action_probability": action_values_mean}
+            action_values = self.networks['actor'].online_network.predict(tf_input_state)
 
-        return action, action_info
+            action = self.exploration_policy.get_action(action_values)
+
+            action_info = ActionInfo(action=action)
+        else:
+            raise ValueError("The action space of the environment is not compatible with the algorithm")
+
+        return action_info

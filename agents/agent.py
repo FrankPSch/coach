@@ -14,567 +14,715 @@
 # limitations under the License.
 #
 
-import scipy.ndimage
 try:
     import matplotlib.pyplot as plt
 except:
     from logger import failed_imports
     failed_imports.append("matplotlib")
 
+from utils import Signal, RunningStat, squeeze_list, force_list
+from core_types import RunPhase, PredictionType, Episodes
+from configurations import MiddlewareTypes
+
 import copy
-from renderer import Renderer
-from configurations import Preset
-from collections import deque
-from utils import LazyStack
-from collections import OrderedDict
-from utils import RunPhase, Signal, is_empty, RunningStat
-from architectures import *
-from exploration_policies import *
-from memories import *
-from memories.memory import *
-from logger import logger, screen
+import numpy as np
+from spaces import SpacesDefinition
+from logger import screen, Logger, EpisodeLogger
 import random
-import time
-import os
-import itertools
-from architectures.tensorflow_components.shared_variables import SharedRunningStats
 from six.moves import range
+from agents.agent_interface import AgentInterface
+from core_types import Transition, ActionInfo, TrainingSteps, EnvironmentSteps, EnvResponse
+from utils import dynamic_import_and_instantiate_module_from_params, call_method_for_all
+from collections import OrderedDict
+from pandas import read_pickle
+from configurations import AgentParameters
+from typing import Dict, List, Union, Tuple
+from architectures.network_wrapper import NetworkWrapper
+from block_factories.block_factory import DistributedTaskParameters
+from memories.episodic_experience_replay import EpisodicExperienceReplay
 
 
-class Agent(object):
-    def __init__(self, env, tuning_parameters, replicated_device=None, task_id=0):
+class Agent(AgentInterface):
+    def __init__(self, agent_parameters: AgentParameters, parent: Union['LevelManager', 'CompositeAgent']=None):
         """
-        :param env: An environment instance
-        :type env: EnvironmentWrapper
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
-        :param replicated_device: A tensorflow device for distributed training (optional)
-        :type replicated_device: instancemethod
-        :param thread_id: The current thread id
-        :param thread_id: int
+        :param agent_parameters: A Preset class instance with all the running paramaters
         """
+        super().__init__()
+        self.ap = agent_parameters
+        self.task_id = self.ap.task_parameters.task_index
+        self.is_chief = self.task_id == 0
+        if self.ap.memory.distributed_memory:
+            self.shared_memory_scratchpad = self.ap.task_parameters.shared_memory_scratchpad
+        self.name = agent_parameters.name
+        self.parent = parent
+        self.parent_level_manager = None
+        # self.full_name_id = agent_parameters.full_name_id = '/'.join([#self.parent.parent_level_manager.name,
+        #                                                               #self.parent.name,
+        #                                                               self.name])
+        self.full_name_id = agent_parameters.full_name_id = self.name
 
-        screen.log_title("Creating agent {}".format(task_id))
-        self.task_id = task_id
-        self.sess = tuning_parameters.sess
-        self.env = tuning_parameters.env_instance = env
+        if type(agent_parameters.task_parameters) == DistributedTaskParameters:
+            screen.log_title("Creating agent - name: {} task id: {} (may take up to 30 seconds due to "
+                             "tensorflow wake up time)".format(self.full_name_id, self.task_id))
+        else:
+            screen.log_title("Creating agent - name: {}".format(self.full_name_id))
         self.imitation = False
+        self.agent_logger = Logger()
+        self.agent_episode_logger = EpisodeLogger()
 
         # i/o dimensions
-        if not tuning_parameters.env.desired_observation_width or not tuning_parameters.env.desired_observation_height:
-            tuning_parameters.env.desired_observation_width = self.env.width
-            tuning_parameters.env.desired_observation_height = self.env.height
-        self.action_space_size = tuning_parameters.env.action_space_size = self.env.action_space_size
-        self.measurements_size = tuning_parameters.env.measurements_size = self.env.measurements_size
-        if tuning_parameters.agent.use_accumulated_reward_as_measurement:
-            self.measurements_size = tuning_parameters.env.measurements_size = (self.measurements_size[0] + 1,)
+        # TODO: update everyone that uses  desired_observation_width, action_space_size and measurements_size
+        # + update the measurements_size if use_accumulated_reward_as_measurement is used
 
-        # modules
-        if tuning_parameters.agent.load_memory_from_file_path:
-            screen.log_title("Loading replay buffer from pickle. Pickle path: {}"
-                             .format(tuning_parameters.agent.load_memory_from_file_path))
-            self.memory = read_pickle(tuning_parameters.agent.load_memory_from_file_path)
+        memory_name = self.ap.memory.path.split(':')[1]
+        lookup_name = self.full_name_id + '.' + memory_name
+        if self.ap.memory.distributed_memory is True and not self.is_chief:
+            self.memory = self.shared_memory_scratchpad.get(lookup_name)
+            # print("agent {} just got a {} from the memory scratchpad".format(self.task_id, memory_name))
         else:
-            self.memory = eval(tuning_parameters.memory + '(tuning_parameters)')
-        # self.architecture = eval(tuning_parameters.architecture)
+            # modules
+            if agent_parameters.memory.load_memory_from_file_path:
+                screen.log_title("Loading replay buffer from pickle. Pickle path: {}"
+                                 .format(agent_parameters.memory.load_memory_from_file_path))
+                self.memory = read_pickle(agent_parameters.memory.load_memory_from_file_path)
+            else:
+                self.memory = dynamic_import_and_instantiate_module_from_params(self.ap.memory)
 
-        self.has_global = replicated_device is not None
-        self.replicated_device = replicated_device
-        self.worker_device = "/job:worker/task:{}/cpu:0".format(task_id) if replicated_device is not None else "/gpu:0"
+            if self.ap.memory.distributed_memory is True and self.is_chief:
+                self.shared_memory_scratchpad.add(lookup_name, self.memory)
+                # print("agent {} just pushed a {} to the memory scratchpad".format(self.task_id, memory_name))
 
-        self.exploration_policy = eval(tuning_parameters.exploration.policy + '(tuning_parameters)')
-        self.evaluation_exploration_policy = eval(tuning_parameters.exploration.evaluation_policy
-                                                  + '(tuning_parameters)')
-        self.evaluation_exploration_policy.change_phase(RunPhase.TEST)
+        if type(agent_parameters.task_parameters) == DistributedTaskParameters:
+            self.has_global = True
+            self.replicated_device = agent_parameters.task_parameters.device
+            self.worker_device = "/job:worker/task:{}/cpu:0".format(self.task_id)
+        else:
+            self.has_global = False
+            self.replicated_device = None
+            self.worker_device = "/gpu:0"
+
+        # filters
+        self.input_filter = self.ap.input_filter
+        self.output_filter = self.ap.output_filter
+        device = self.replicated_device if self.replicated_device else self.worker_device
+        self.input_filter.set_device(device)
+        self.output_filter.set_device(device)
 
         # initialize all internal variables
-        self.tp = tuning_parameters
-        self.in_heatup = False
+        self._phase = RunPhase.HEATUP
+        self.total_shaped_reward_in_current_episode = 0
         self.total_reward_in_current_episode = 0
         self.total_steps_counter = 0
         self.running_reward = None
         self.training_iteration = 0
-        self.current_episode = self.tp.current_episode = 0
+        self.last_target_network_update_step = 0
+        self.last_training_phase_step = 0
+        self.current_episode = self.ap.current_episode = 0
         self.curr_state = {}
         self.current_episode_steps_counter = 0
         self.episode_running_info = {}
         self.last_episode_evaluation_ran = 0
         self.running_observations = []
-        logger.set_current_time(self.current_episode)
-        self.main_network = None
-        self.networks = []
-        self.last_episode_images = []
-        self.renderer = Renderer()
+        self.agent_logger.set_current_time(self.current_episode)
+        self.exploration_policy = None
+        self.networks = {}
+        self.last_action_info = None
+        self.running_observation_stats = None
+        self.running_reward_stats = None
+        # TODO: add observations rendering from master
+
+        # environment parameters
+        self.spaces = None
 
         # signals
-        self.signals = []
-        self.loss = Signal('Loss')
-        self.signals.append(self.loss)
-        self.curr_learning_rate = Signal('Learning Rate')
-        self.signals.append(self.curr_learning_rate)
+        self.episode_signals = []
+        self.step_signals = []
+        self.loss = self.register_signal('Loss')
+        self.curr_learning_rate = self.register_signal('Learning Rate')
+        self.unclipped_grads = self.register_signal('Grads (unclipped)')
+        self.reward = self.register_signal('Reward', dump_one_value_per_episode=False, dump_one_value_per_step=True)
+        self.shaped_reward = self.register_signal('Shaped Reward', dump_one_value_per_episode=False, dump_one_value_per_step=True)
 
-        if self.tp.env.normalize_observation and not self.env.is_state_type_image:
-            if not self.tp.distributed or not self.tp.agent.share_statistics_between_workers:
-                self.running_observation_stats = RunningStat((self.tp.env.desired_observation_width,))
-                self.running_reward_stats = RunningStat(())
-                if self.tp.checkpoint_restore_dir:
-                    checkpoint_path = os.path.join(self.tp.checkpoint_restore_dir, "running_stats.p")
-                    self.running_observation_stats = read_pickle(checkpoint_path)
-                else:
-                    self.running_observation_stats = RunningStat((self.tp.env.desired_observation_width,))
-                    self.running_reward_stats = RunningStat(())
-            else:
-                self.running_observation_stats = SharedRunningStats(self.tp, replicated_device,
-                                                                    shape=(self.tp.env.desired_observation_width,),
-                                                                    name='observation_stats')
-                self.running_reward_stats = SharedRunningStats(self.tp, replicated_device,
-                                                               shape=(),
-                                                               name='reward_stats')
-
-        # env is already reset at this point. Otherwise we're getting an error where you cannot
-        # reset an env which is not done
-        self.reset_game(do_not_reset_env=True)
+        # TODO - reenable this
+        # if self.ap.env.check_successes:
+        #     self.success_ratio = self.register_signal('Success Ratio')
+        #     self.mean_reward = self.register_signal('Mean Reward')
 
         # use seed
-        if self.tp.seed is not None:
-            random.seed(self.tp.seed)
-            np.random.seed(self.tp.seed)
+        if self.ap.task_parameters.seed is not None:
+            random.seed(self.ap.task_parameters.seed)
+            np.random.seed(self.ap.task_parameters.seed)
 
-    def log_to_screen(self, phase):
+    def setup_logger(self):
+        # TODO: this is ugly. we should do it nicer.
+        # dump documentation
+        logger_prefix = "{block_name}.{level_name}.{agent_full_id}".\
+            format(block_name=self.parent_level_manager.parent_block_scheduler.name,
+                   level_name=self.parent_level_manager.name,
+                   agent_full_id='.'.join(self.full_name_id.split('/')))
+        self.agent_logger.set_logger_filenames(self.ap.task_parameters.experiment_path, logger_prefix=logger_prefix,
+                                               add_timestamp=True, task_id=self.task_id)
+        if self.ap.visualization.dump_in_episode_signals:
+            self.agent_episode_logger.set_logger_filenames(self.ap.task_parameters.experiment_path,
+                                                           logger_prefix=logger_prefix,
+                                                           add_timestamp=True, task_id=self.task_id)
+
+    def set_session(self, sess) -> None:
+        """
+        Set the deep learning framework session for all the agents in the composite agent
+        :return: None
+        """
+        self.input_filter.set_session(sess)
+        self.output_filter.set_session(sess)
+        [network.set_session(sess) for network in self.networks.values()]
+
+    def register_signal(self, signal_name: str, dump_one_value_per_episode: bool=True,
+                        dump_one_value_per_step: bool=False) -> Signal:
+        signal = Signal(signal_name)
+        if dump_one_value_per_episode:
+            self.episode_signals.append(signal)
+        if dump_one_value_per_step:
+            self.step_signals.append(signal)
+        return signal
+
+    def set_environment_parameters(self, spaces: SpacesDefinition):
+        """
+        Sets the parameters that are environment dependent. As a side effect, initializes all the components that are
+        dependent on those values, by calling init_environment_dependent_modules
+        :param spaces: the environment spaces definition
+        :return: None
+        """
+        self.spaces = copy.deepcopy(spaces)
+        for observation_name in self.spaces.state.sub_spaces.keys():
+            self.spaces.state[observation_name] = \
+                self.input_filter.get_filtered_observation_space(observation_name, self.spaces.state[observation_name])
+        self.spaces.reward = self.input_filter.get_filtered_reward_space(self.spaces.reward)
+        self.spaces.action = self.output_filter.get_unfiltered_action_space(self.spaces.action)
+        self.init_environment_dependent_modules()
+
+    def create_networks(self) -> Dict[str, NetworkWrapper]:
+        """
+        Create all the networks of the agent.
+        The network creation will be done after setting the environment parameters for the agent, since they are needed
+        for creating the network.
+        :return: A list containing all the networks
+        """
+        networks = {}
+        for network_name in self.ap.network_wrappers.keys():
+            networks[network_name] = NetworkWrapper(name=network_name,
+                                                    agent_parameters=self.ap,
+                                                    has_target=self.ap.network_wrappers[network_name].create_target_network,
+                                                    has_global=self.has_global,
+                                                    spaces=self.spaces,
+                                                    replicated_device=self.replicated_device,
+                                                    worker_device=self.worker_device)
+        return networks
+
+    def init_environment_dependent_modules(self) -> None:
+        """
+        Initialize any modules that depend on knowing information about the environment such as the action space or
+        the observation space
+        :return: None
+        """
+        # initialize exploration policy
+        self.ap.exploration.action_space = self.spaces.action
+        self.exploration_policy = dynamic_import_and_instantiate_module_from_params(self.ap.exploration)
+
+        # create all the networks of the agent
+        self.networks = self.create_networks()
+
+    @property
+    def phase(self) -> RunPhase:
+        return self._phase
+
+    @phase.setter
+    def phase(self, val: RunPhase) -> None:
+        """
+        Change the phase of the run for the agent and all the sub components
+        :param phase: the new run phase (TRAIN, TEST, etc.)
+        :return: None
+        """
+        self._phase = val
+        self.exploration_policy.change_phase(val)
+
+    def log_to_screen(self):
         # log to screen
-        if self.current_episode >= 0:
-            if phase == RunPhase.TRAIN:
-                exploration = self.exploration_policy.get_control_param()
-            else:
-                exploration = self.evaluation_exploration_policy.get_control_param()
+        log = OrderedDict()
+        if self.task_id is not None:
+            log["Worker"] = self.task_id
+        log["Episode"] = self.current_episode
+        log["Total reward"] = np.round(self.total_reward_in_current_episode, 2)
+        log["Exploration"] = np.round(self.exploration_policy.get_control_param(), 2)
+        log["Steps"] = self.total_steps_counter
+        log["Training iteration"] = self.training_iteration
+        screen.log_dict(log, prefix=self.phase.value)
 
-            screen.log_dict(
-                OrderedDict([
-                    ("Worker", self.task_id),
-                    ("Episode", self.current_episode),
-                    ("total reward", self.total_reward_in_current_episode),
-                    ("exploration", exploration),
-                    ("steps", self.total_steps_counter),
-                    ("training iteration", self.training_iteration)
-                ]),
-                prefix=phase
-            )
-
-    def update_log(self, phase=RunPhase.TRAIN):
+    def update_step_in_episode_log(self):
         """
         Writes logging messages to screen and updates the log file with all the signal values.
         :return: None
         """
         # log all the signals to file
-        logger.set_current_time(self.current_episode)
-        logger.create_signal_value('Training Iter', self.training_iteration)
-        logger.create_signal_value('In Heatup', int(phase == RunPhase.HEATUP))
-        logger.create_signal_value('ER #Transitions', self.memory.num_transitions())
-        logger.create_signal_value('ER #Episodes', self.memory.length())
-        logger.create_signal_value('Episode Length', self.current_episode_steps_counter)
-        logger.create_signal_value('Total steps', self.total_steps_counter)
-        logger.create_signal_value("Epsilon", self.exploration_policy.get_control_param())
-        logger.create_signal_value("Training Reward", self.total_reward_in_current_episode
-                                   if phase == RunPhase.TRAIN else np.nan)
-        logger.create_signal_value('Evaluation Reward', self.total_reward_in_current_episode
-                                   if phase == RunPhase.TEST else np.nan)
-        logger.create_signal_value('Update Target Network', 0, overwrite=False)
-        logger.update_wall_clock_time(self.current_episode)
+        self.agent_episode_logger.set_current_time(self.current_episode_steps_counter)
+        self.agent_episode_logger.create_signal_value('Training Iter', self.training_iteration)
+        self.agent_episode_logger.create_signal_value('In Heatup', int(self._phase == RunPhase.HEATUP))
+        self.agent_episode_logger.create_signal_value('ER #Transitions', self.memory.num_transitions())
+        self.agent_episode_logger.create_signal_value('ER #Episodes', self.memory.length())
+        self.agent_episode_logger.create_signal_value('Total steps', self.total_steps_counter)
+        self.agent_episode_logger.create_signal_value("Epsilon", self.exploration_policy.get_control_param())
+        self.agent_episode_logger.create_signal_value("Shaped Accumulated Reward", self.total_shaped_reward_in_current_episode)
+        self.agent_episode_logger.create_signal_value('Update Target Network', 0, overwrite=False)
+        self.agent_episode_logger.update_wall_clock_time(self.current_episode_steps_counter)
 
-        for signal in self.signals:
-            logger.create_signal_value("{}/Mean".format(signal.name), signal.get_mean())
-            logger.create_signal_value("{}/Stdev".format(signal.name), signal.get_stdev())
-            logger.create_signal_value("{}/Max".format(signal.name), signal.get_max())
-            logger.create_signal_value("{}/Min".format(signal.name), signal.get_min())
+        for signal in self.step_signals:
+            self.agent_episode_logger.create_signal_value(signal.name, signal.get_last_value())
 
         # dump
-        if self.current_episode % self.tp.visualization.dump_signals_to_csv_every_x_episodes == 0 \
-                and self.current_episode > 0:
-            logger.dump_output_csv()
+        self.agent_episode_logger.dump_output_csv()
 
-    def reset_game(self, do_not_reset_env=False):
+    def update_log(self):
         """
-        Resets all the episodic parameters and start a new environment episode.
-        :param do_not_reset_env: A boolean that allows prevention of environment reset
+        Writes logging messages to screen and updates the log file with all the signal values.
         :return: None
         """
+        # log all the signals to file
+        self.agent_logger.set_current_time(self.current_episode)
+        self.agent_logger.create_signal_value('Training Iter', self.training_iteration)
+        self.agent_logger.create_signal_value('In Heatup', int(self._phase == RunPhase.HEATUP))
+        self.agent_logger.create_signal_value('ER #Transitions', self.memory.num_transitions())
+        self.agent_logger.create_signal_value('ER #Episodes', self.memory.length())
+        self.agent_logger.create_signal_value('Episode Length', self.current_episode_steps_counter)
+        self.agent_logger.create_signal_value('Total steps', self.total_steps_counter)
+        self.agent_logger.create_signal_value("Epsilon", np.mean(self.exploration_policy.get_control_param()))
+        self.agent_logger.create_signal_value("Shaped Training Reward", self.total_shaped_reward_in_current_episode
+                                   if self._phase == RunPhase.TRAIN else np.nan)
+        self.agent_logger.create_signal_value("Training Reward", self.total_reward_in_current_episode
+                                   if self._phase == RunPhase.TRAIN else np.nan)
+        self.agent_logger.create_signal_value('Shaped Evaluation Reward', self.total_shaped_reward_in_current_episode
+                                   if self._phase == RunPhase.TEST else np.nan)
+        self.agent_logger.create_signal_value('Evaluation Reward', self.total_reward_in_current_episode
+                                   if self._phase == RunPhase.TEST else np.nan)
+        self.agent_logger.create_signal_value('Update Target Network', 0, overwrite=False)
+        self.agent_logger.update_wall_clock_time(self.current_episode)
 
-        for signal in self.signals:
+        for signal in self.episode_signals:
+            self.agent_logger.create_signal_value("{}/Mean".format(signal.name), signal.get_mean())
+            self.agent_logger.create_signal_value("{}/Stdev".format(signal.name), signal.get_stdev())
+            self.agent_logger.create_signal_value("{}/Max".format(signal.name), signal.get_max())
+            self.agent_logger.create_signal_value("{}/Min".format(signal.name), signal.get_min())
+
+        # dump
+        if self.current_episode % self.ap.visualization.dump_signals_to_csv_every_x_episodes == 0 \
+                and self.current_episode > 0:
+            self.agent_logger.dump_output_csv()
+
+    def end_episode(self) -> None:
+        """
+        End an episode
+        :return: None
+        """
+        self.current_episode += 1
+        if self.ap.visualization.dump_csv:
+            self.update_log()
+
+        if self.ap.visualization.print_summary:
+            self.log_to_screen()
+
+    def reset(self):
+        """
+        Reset all the episodic parameters
+        :return: None
+        """
+        for signal in self.episode_signals:
             signal.reset()
+        for signal in self.step_signals:
+            signal.reset()
+        self.agent_episode_logger.set_episode_idx(self.current_episode)
+        self.total_shaped_reward_in_current_episode = 0
         self.total_reward_in_current_episode = 0
         self.curr_state = {}
-        self.last_episode_images = []
         self.current_episode_steps_counter = 0
         self.episode_running_info = {}
-        if not do_not_reset_env:
-            self.env.reset()
-        self.exploration_policy.reset()
+        if self.exploration_policy:
+            self.exploration_policy.reset()
+        self.input_filter.reset()
+        self.output_filter.reset()
+        if isinstance(self.memory, EpisodicExperienceReplay):
+            self.memory.verify_last_episode_is_closed()
 
-        # required for online plotting
-        if self.tp.visualization.plot_action_values_online:
-            if hasattr(self, 'episode_running_info') and hasattr(self.env, 'actions_description'):
-                for action in self.env.actions_description:
-                    self.episode_running_info[action] = []
-            plt.clf()
-
-        if self.tp.agent.middleware_type == MiddlewareTypes.LSTM:
-            for network in self.networks:
+        #TODO - this is broken, need to match network name in ap to the agent's networks (i.e. have dict instead of
+        #  list)
+        for network_wrapper in self.ap.network_wrappers.keys():
+            if self.ap.network_wrappers[network_wrapper].middleware_type == MiddlewareTypes.LSTM:
+                network = self.networks[network_wrapper]
                 network.online_network.curr_rnn_c_in = network.online_network.middleware_embedder.c_init
                 network.online_network.curr_rnn_h_in = network.online_network.middleware_embedder.h_init
 
-        self.prepare_initial_state()
-
-    def preprocess_observation(self, observation):
-        """
-        Preprocesses the given observation.
-        For images - convert to grayscale, resize and convert to int.
-        For measurements vectors - normalize by a running average and std.
-        :param observation: The agents observation
-        :return: A processed version of the observation
-        """
-
-        if self.env.is_state_type_image:
-            # rescale
-            observation = scipy.misc.imresize(observation,
-                                              (self.tp.env.desired_observation_height,
-                                               self.tp.env.desired_observation_width),
-                                              interp=self.tp.rescaling_interpolation_type)
-            # rgb to y
-            if len(observation.shape) > 2 and observation.shape[2] > 1:
-                r, g, b = observation[:, :, 0], observation[:, :, 1], observation[:, :, 2]
-                observation = 0.2989 * r + 0.5870 * g + 0.1140 * b
-
-            # Render the processed observation which is how the agent will see it
-            # Warning: this cannot currently be done in parallel to rendering the environment
-            if self.tp.visualization.render_observation:
-                if not self.renderer.is_open:
-                    self.renderer.create_screen(observation.shape[0], observation.shape[1])
-                self.renderer.render_image(observation)
-
-            return observation.astype('uint8')
-        else:
-            if self.tp.env.normalize_observation and self.sess is not None:
-                # standardize the input observation using a running mean and std
-                if not self.tp.distributed or not self.tp.agent.share_statistics_between_workers:
-                    self.running_observation_stats.push(observation)
-                observation = (observation - self.running_observation_stats.mean) / \
-                              (self.running_observation_stats.std + 1e-15)
-                observation = np.clip(observation, -5.0, 5.0)
-            return observation
-
-    def learn_from_batch(self, batch):
+    def learn_from_batch(self, batch) -> Tuple[float, List, List]:
         """
         Given a batch of transitions, calculates their target values and updates the network.
         :param batch: A list of transitions
-        :return: The loss of the training
+        :return: The total loss of the training, the loss per head and the unclipped gradients
         """
-        pass
+        return 0, [], []
+
+    def _should_update_online_weights_to_target(self):
+        """
+        Determine if online weights should be copied to the target.
+        :return: boolean: True if the online weights should be copied to the target.
+        """
+        # TODO: modify all the presets such that this parameter will be defined in this manner
+        # TODO: this shouldn't be called if there is no target network
+        # TODO: allow specifying in frames
+        # update the target network of every network that has a target network
+        step_method = self.ap.algorithm.num_steps_between_copying_online_weights_to_target
+        if step_method.__class__ == TrainingSteps:
+            should_update = (self.training_iteration - self.last_target_network_update_step) >= step_method.num_steps
+            if should_update:
+                self.last_target_network_update_step = self.training_iteration
+        elif step_method.__class__ == EnvironmentSteps:
+            should_update = (self.total_steps_counter - self.last_target_network_update_step) >= step_method.num_steps
+            if should_update:
+                self.last_target_network_update_step = self.total_steps_counter
+        else:
+            raise ValueError("The num_steps_between_copying_online_weights_to_target parameter should be either "
+                             "EnvironmentSteps or TrainingSteps. Instead it is {}".format(step_method.__class__))
+        return should_update
+
+    def _should_train(self, wait_for_full_episode=False):
+        """
+        Determine if we should start a training phase according to the number of steps passed since the last training
+        :return:  boolean: True if we should start a training phase
+        """
+        step_method = self.ap.algorithm.num_consecutive_playing_steps
+        if step_method.__class__ == Episodes:
+            should_update = (self.current_episode - self.last_training_phase_step) >= step_method.num_steps
+            if should_update:
+                self.last_training_phase_step = self.current_episode
+        elif step_method.__class__ == EnvironmentSteps:
+            should_update = (self.total_steps_counter - self.last_training_phase_step) >= step_method.num_steps
+            if wait_for_full_episode:
+                should_update = should_update and self.current_episode_steps_counter == 0
+            if should_update:
+                self.last_training_phase_step = self.total_steps_counter
+        else:
+            raise ValueError("The num_consecutive_playing_steps parameter should be either "
+                             "EnvironmentSteps or Episodes. Instead it is {}".format(step_method.__class__))
+        return should_update
 
     def train(self):
         """
-        A single training iteration. Sample a batch, train on it and update target networks.
-        :return: The training loss.
+        Check if a training phase should be done as configured by num_consecutive_playing_steps.
+        If it should, then do several training steps as configured by num_consecutive_training_steps.
+        A single training iteration: Sample a batch, train on it and update target networks.
+        :return: The total training loss during the training iterations.
         """
-        batch = self.memory.sample(self.tp.batch_size)
-        loss = self.learn_from_batch(batch)
+        loss = 0
+        if self._should_train():
+            for training_step in range(self.ap.algorithm.num_consecutive_training_steps):
+                # TODO: this should be network dependent!
+                network_parameters = list(self.ap.network_wrappers.values())[0]
 
-        if self.tp.learning_rate_decay_rate != 0:
-            self.curr_learning_rate.add_sample(self.tp.sess.run(self.tp.learning_rate))
-        else:
-            self.curr_learning_rate.add_sample(self.tp.learning_rate)
+                # update counters
+                self.training_iteration += 1
 
-        # update the target network of every network that has a target network
-        if self.total_steps_counter % self.tp.agent.num_steps_between_copying_online_weights_to_target == 0:
-            for network in self.networks:
-                network.update_target_network(self.tp.agent.rate_for_copying_weights_to_target)
-            logger.create_signal_value('Update Target Network', 1)
-        else:
-            logger.create_signal_value('Update Target Network', 0, overwrite=False)
+                # sample a batch and train on it
+                batch = self.memory.sample(network_parameters.batch_size)
+
+                # if the batch returned empty then there are not enough samples in the replay buffer -> skip
+                # training step
+                if len(batch) > 0:
+                    # train
+                    total_loss, losses, unclipped_grads = self.learn_from_batch(batch)
+                    loss += total_loss
+                    self.unclipped_grads.add_sample(unclipped_grads)
+
+                    # TODO: why is this done here? it also uses tensorflow directly which is problematic
+                    # decay learning rate
+                    if network_parameters.learning_rate_decay_rate != 0:
+                        self.curr_learning_rate.add_sample(self.networks['main'].sess.run(
+                            self.networks['main'].online_network.current_learning_rate))
+                    else:
+                        self.curr_learning_rate.add_sample(network_parameters.learning_rate)
+
+                    if self._should_update_online_weights_to_target():
+                        for network in self.networks.values():
+                            network.update_target_network(self.ap.algorithm.rate_for_copying_weights_to_target)
+
+                        self.agent_logger.create_signal_value('Update Target Network', 1)
+                    else:
+                        self.agent_logger.create_signal_value('Update Target Network', 0, overwrite=False)
+
+                    self.loss.add_sample(loss)
+
+                    if self.imitation:
+                        self.log_to_screen()
+
+            # run additional commands after the training is done
+            self.post_training_commands()
 
         return loss
 
-    def extract_batch(self, batch):
+    def extract_batch(self, batch, network_name):
         """
         Extracts a single numpy array for each object in a batch of transitions (state, action, etc.)
         :param batch: An array of transitions
         :return: For each transition element, returns a numpy array of all the transitions in the batch
         """
+
+        # extract current and next states
         current_states = {}
         next_states = {}
-        current_states['observation'] = np.array([np.array(transition.state['observation']) for transition in batch])
-        next_states['observation'] = np.array([np.array(transition.next_state['observation']) for transition in batch])
+        for key in self.ap.network_wrappers[network_name].input_types.keys():
+            current_states[key] = np.array([np.array(transition.state[key]) for transition in batch])
+            next_states[key] = np.array([np.array(transition.next_state[key]) for transition in batch])
+
+        # extract the rest of the data into batch structures
         actions = np.array([transition.action for transition in batch])
         rewards = np.array([transition.reward for transition in batch])
         game_overs = np.array([transition.game_over for transition in batch])
-        total_return = np.array([transition.total_return for transition in batch])
 
-        # get the entire state including measurements if available
-        if self.tp.agent.use_measurements:
-            current_states['measurements'] = np.array([transition.state['measurements'] for transition in batch])
-            next_states['measurements'] = np.array([transition.next_state['measurements'] for transition in batch])
+        # check if the total return is available
+        total_return = None
+        if batch[0]._total_return:
+            total_return = np.array([transition.total_return for transition in batch])
 
         return current_states, next_states, actions, rewards, game_overs, total_return
 
-    def plot_action_values_online(self):
-        """
-        Plot an animated graph of the value of each possible action during the episode
-        :return: None
-        """
-
-        plt.clf()
-        for key, data_list in self.episode_running_info.items():
-            plt.plot(data_list, label=key)
-        plt.legend()
-        plt.pause(0.00000001)
-
-    def choose_action(self, curr_state, phase=RunPhase.TRAIN):
+    def choose_action(self, curr_state):
         """
         choose an action to act with in the current episode being played. Different behavior might be exhibited when training
          or testing.
 
         :param curr_state: the current state to act upon.
-        :param phase: the current phase: training or testing.
         :return: chosen action, some action value describing the action (q-value, probability, etc)
         """
         pass
 
-    def preprocess_reward(self, reward):
-        if self.tp.env.reward_scaling:
-            reward /= float(self.tp.env.reward_scaling)
-        if self.tp.env.reward_clipping_max:
-            reward = min(reward, self.tp.env.reward_clipping_max)
-        if self.tp.env.reward_clipping_min:
-            reward = max(reward, self.tp.env.reward_clipping_min)
-        return reward
-
-    def tf_input_state(self, curr_state):
+    def dict_state_to_batches_dict(self, curr_state: Union[Dict[str, np.ndarray], List[Dict[str, np.ndarray]]],
+                                   network_name: str):
         """
         convert curr_state into input tensors tensorflow is expecting.
         """
-        # add batch axis with length 1 onto each value
-        # extract values from the state based on agent.input_types
-        input_state = {}
-        for input_name in self.tp.agent.input_types.keys():
-            input_state[input_name] = np.expand_dims(np.array(curr_state[input_name]), 0)
-        return input_state
-        
-    def prepare_initial_state(self):
-        """
-        Create an initial state when starting a new episode
-        :return: None
-        """
-        observation = self.preprocess_observation(self.env.state['observation'])
-        self.curr_stack = deque([observation]*self.tp.env.observation_stack_size, maxlen=self.tp.env.observation_stack_size)
-        observation = LazyStack(self.curr_stack, -1)
+        # convert to batch so we can run it through the network
+        curr_states = force_list(curr_state)
+        batches_dict = {}
+        for key in self.ap.network_wrappers[network_name].input_types.keys():
+            if key in curr_states[0].keys():
+                batches_dict[key] = np.array([np.array(curr_state[key]) for curr_state in curr_states])
 
-        self.curr_state = {
-            'observation': observation
-        }
-        if self.tp.agent.use_measurements:
-            if 'measurements' in self.env.state.keys():
-                self.curr_state['measurements'] = self.env.state['measurements']
-            else:
-                self.curr_state['measurements'] = np.zeros(0)
-            if self.tp.agent.use_accumulated_reward_as_measurement:
-                self.curr_state['measurements'] = np.append(self.curr_state['measurements'], 0)
+        return batches_dict
 
-    def act(self, phase=RunPhase.TRAIN):
+    def act(self) -> ActionInfo:
         """
-        Take one step in the environment according to the network prediction and store the transition in memory
-        :param phase: Either Train or Test to specify if greedy actions should be used and if transitions should be stored
-        :return: A boolean value that signals an episode termination
+        Given the agents current knowledge, decide on the next action to apply to the environment
+        :return: an action and a dictionary containing any additional info from the action decision process
         """
+        # assert type(self.ap.algorithm.num_consecutive_playing_steps) == EnvironmentSteps
+        if self.phase == RunPhase.TRAIN and self.ap.algorithm.num_consecutive_playing_steps.num_steps == 0:
+            # This agent never plays  while training (e.g. behavioral cloning)
+            return None
 
-        if phase != RunPhase.TEST:
+        # count steps (only when training or if we are in the evaluation worker)
+        if self.phase != RunPhase.TEST or self.ap.task_parameters.evaluate_only:
             self.total_steps_counter += 1
         self.current_episode_steps_counter += 1
 
-        # get new action
-        action_info = {"action_probability": 1.0 / self.env.action_space_size, "action_value": 0, "max_action_value": 0}
-
-        if phase == RunPhase.HEATUP and not self.tp.heatup_using_network_decisions:
-            action = self.env.get_random_action()
+        # decide on the action
+        if self.phase == RunPhase.HEATUP and not self.ap.algorithm.heatup_using_network_decisions:
+            # random action
+            self.last_action_info = self.spaces.action.sample_with_info()
         else:
-            action, action_info = self.choose_action(self.curr_state, phase=phase)
+            # informed action
+            self.last_action_info = self.choose_action(self.curr_state)
 
-        # perform action
-        if type(action) == np.ndarray:
-            action = action.squeeze()
-        result = self.env.step(action)
+        filtered_action_info = self.output_filter.filter(self.last_action_info)
 
-        shaped_reward = self.preprocess_reward(result['reward'])
-        if 'action_intrinsic_reward' in action_info.keys():
-            shaped_reward += action_info['action_intrinsic_reward']
-        # TODO: should total_reward_in_current_episode include shaped_reward?
-        self.total_reward_in_current_episode += result['reward']
-        next_state = copy.copy(result['state'])
-        next_state['observation'] = self.preprocess_observation(next_state['observation'])
+        return filtered_action_info
 
-        # plot action values online
-        if self.tp.visualization.plot_action_values_online and phase != RunPhase.HEATUP:
-            self.plot_action_values_online()
+    def get_state_embedding(self, state: dict) -> np.ndarray:
+        """
+        Given a state, get the corresponding state embedding  from the main network
+        :param state: a state dict
+        :return: a numpy embedding vector
+        """
+        # TODO: this won't work anymore
+        # TODO: instead of the state embedding (which contains the goal) we should use the observation embedding
+        embedding = self.networks['main'].online_network.predict(
+            self.dict_state_to_batches_dict(state, "main"),
+            outputs=self.networks['main'].online_network.state_embedding)
+        return embedding
 
-        # initialize the next state
-        # TODO: provide option to stack more than just the observation
-        self.curr_stack.append(next_state['observation'])
-        observation = LazyStack(self.curr_stack, -1)
+    def observe(self, env_response: EnvResponse) -> bool:
+        """
+        Given a response from the environment, distill the observation from it and store it for later use.
+        The response should be a dictionary containing the performed action, the new observation and measurements,
+        the reward, a game over flag and any additional information necessary.
+        :param env_response: result of call from environment.step(action)
+        :return:
+        """
 
-        next_state['observation'] = observation
-        if self.tp.agent.use_measurements:
-            if 'measurements' in result['state'].keys():
-                next_state['measurements'] = result['state']['measurements']
+        # filter the env_response
+        filtered_env_response = self.input_filter.filter(env_response)
+
+        if self.current_episode_steps_counter > 0:
+            transition = Transition(state=copy.copy(self.curr_state), action=self.last_action_info.action,
+                                    reward=filtered_env_response.reward, next_state=filtered_env_response.new_state,
+                                    game_over=filtered_env_response.game_over, info=filtered_env_response.info,
+                                    goal=filtered_env_response.goal)
+        else:
+            transition = Transition(next_state=filtered_env_response.new_state,
+                                    game_over=filtered_env_response.game_over,
+                                    info=filtered_env_response.info,
+                                    goal=filtered_env_response.goal)
+
+        self.curr_state = transition.next_state
+
+        # if we are in the first step in the episode, then we don't have a transition yet, and therefore we don't need
+        # to store anything in the memory, and we have no reward
+        if self.current_episode_steps_counter > 0:
+            # merge the intrinsic reward in
+            if self.ap.algorithm.scale_external_reward_by_intrinsic_reward_value:
+                transition.reward = transition.reward * (1 + self.last_action_info.action_intrinsic_reward)
             else:
-                next_state['measurements'] = np.zeros(0)
-            if self.tp.agent.use_accumulated_reward_as_measurement:
-                next_state['measurements'] = np.append(next_state['measurements'], self.total_reward_in_current_episode)
+                transition.reward = transition.reward + self.last_action_info.action_intrinsic_reward
 
-        # store the transition only if we are training
-        if phase == RunPhase.TRAIN or phase == RunPhase.HEATUP:
-            transition = Transition(self.curr_state, result['action'], shaped_reward, next_state, result['done'])
-            for key in action_info.keys():
-                transition.info[key] = action_info[key]
-            if self.tp.agent.add_a_normalized_timestep_to_the_observation:
+            # TODO: we want to also have the raw reward for printing
+            # sum up the total shaped reward
+            self.total_shaped_reward_in_current_episode += transition.reward
+            self.total_reward_in_current_episode += env_response.reward
+            self.shaped_reward.add_sample(transition.reward)
+            self.reward.add_sample(env_response.reward)
+
+            # add action info to transition
+            if type(self.parent).__name__ == 'CompositeAgent':
+                transition.add_info(self.parent.last_action_info.__dict__)
+            else:
+                transition.add_info(self.last_action_info.__dict__)
+
+            # TODO: implement as a filter
+            if self.ap.algorithm.use_accumulated_reward_as_measurement:
+                transition.next_state['measurements'] = np.append(transition.next_state['measurements'],
+                                                                  self.total_shaped_reward_in_current_episode)
+            # TODO: move to a filter
+            if self.ap.algorithm.add_a_normalized_timestep_to_the_observation:
                 transition.info['timestep'] = float(self.current_episode_steps_counter) / self.env.timestep_limit
-            self.memory.store(transition)
-        elif phase == RunPhase.TEST and self.tp.visualization.dump_gifs:
-            # we store the transitions only for saving gifs
-            self.last_episode_images.append(self.env.get_rendered_image())
 
-        # update the current state for the next step
-        self.curr_state = next_state
+            # create and store the transition
+            if self.phase in [RunPhase.TRAIN, RunPhase.HEATUP]:
+                self.memory.store(transition)
 
-        # deal with episode termination
-        if result['done']:
-            if self.tp.visualization.dump_csv:
-                self.update_log(phase=phase)
-            self.log_to_screen(phase=phase)
+            if self.ap.visualization.dump_in_episode_signals:
+                self.update_step_in_episode_log()
 
-            if phase == RunPhase.TRAIN or phase == RunPhase.HEATUP:
-                self.reset_game()
+        return transition.game_over
 
-            self.current_episode += 1
-            self.tp.current_episode = self.current_episode
-
-        # return episode really ended
-        return result['done']
-
-    def evaluate(self, num_episodes, keep_networks_synced=False):
-        """
-        Run in an evaluation mode for several episodes. Actions will be chosen greedily.
-        :param keep_networks_synced: keep the online network in sync with the global network after every episode
-        :param num_episodes: The number of episodes to evaluate on
-        :return: None
-        """
-
-        max_reward_achieved = -float('inf')
-        average_evaluation_reward = 0
-        screen.log_title("Running evaluation")
-        self.env.change_phase(RunPhase.TEST)
-        for i in range(num_episodes):
-            # keep the online network in sync with the global network
-            if keep_networks_synced:
-                for network in self.networks:
-                    network.sync()
-
-            episode_ended = False
-            while not episode_ended:
-                episode_ended = self.act(phase=RunPhase.TEST)
-
-                if keep_networks_synced \
-                   and self.total_steps_counter % self.tp.agent.update_evaluation_agent_network_after_every_num_steps:
-                    for network in self.networks:
-                        network.sync()
-
-            if self.total_reward_in_current_episode > max_reward_achieved:
-                max_reward_achieved = self.total_reward_in_current_episode
-                frame_skipping = int(5/self.tp.env.frame_skip)
-                if self.tp.visualization.dump_gifs:
-                    logger.create_gif(self.last_episode_images[::frame_skipping],
-                                      name='score-{}'.format(max_reward_achieved), fps=10)
-
-            average_evaluation_reward += self.total_reward_in_current_episode
-            self.reset_game()
-
-        average_evaluation_reward /= float(num_episodes)
-
-        self.env.change_phase(RunPhase.TRAIN)
-        screen.log_title("Evaluation done. Average reward = {}.".format(average_evaluation_reward))
+    # def evaluate(self, num_episodes, keep_networks_synced=False):
+    #     """
+    #     Run in an evaluation mode for several episodes. Actions will be chosen greedily.
+    #     :param keep_networks_synced: keep the online network in sync with the global network after every episode
+    #     :param num_episodes: The number of episodes to evaluate on
+    #     :return: None
+    #     """
+    #
+    #     max_reward_achieved = -float('inf')
+    #     average_evaluation_reward = 0
+    #
+    #     if self.ap.env.check_successes:
+    #         number_successes = 0
+    #
+    #     screen.log_title("Running evaluation")
+    #     self.phase = RunPhase.TEST
+    #     for i in range(num_episodes):
+    #         # keep the online network in sync with the global network
+    #         if keep_networks_synced:
+    #             for network in self.networks.values():
+    #                 network.sync()
+    #
+    #         # act for one episode
+    #         episode_ended = False
+    #         while not episode_ended:
+    #             episode_ended = self.act_and_observe()
+    #
+    #             if keep_networks_synced \
+    #                and self.total_steps_counter % self.ap.algorithm.update_evaluation_agent_network_after_every_num_steps:
+    #                 for network in self.networks.values():
+    #                     network.sync()
+    #
+    #         average_evaluation_reward += self.total_shaped_reward_in_current_episode
+    #
+    #         # check if the reward passed the reward threshold
+    #         if self.ap.env.check_successes:
+    #             if self.ap.env.custom_reward_threshold is not None:
+    #                 reward_threshold = self.ap.env.custom_reward_threshold
+    #             elif self.env.reward_success_threshold is not None:
+    #                 reward_threshold = self.env.reward_success_threshold
+    #             else:
+    #                 raise ValueError("There is no reward threshold defined for the environment")
+    #             if self.total_shaped_reward_in_current_episode >= reward_threshold:
+    #                 number_successes += 1
+    #
+    #         self.reset()
+    #
+    #     # summarize the evaluation phase
+    #     average_evaluation_reward /= float(num_episodes)
+    #     screen.log_title("Evaluation done. Average reward = {}.".format(average_evaluation_reward))
+    #
+    #     # TODO: determine general method for allowing users to specify custom
+    #     # metrics/callbacks
+    #     if self.ap.env.check_successes:
+    #         percent_success = number_successes / float(num_episodes)
+    #         screen.log_title("Percent success = {}.".format(percent_success))
+    #         self.success_ratio.add_sample(percent_success)
+    #
+    #         if percent_success >= 1.0:
+    #             # end training
+    #             self.ap.num_training_iterations = self.training_iteration
+    #
+    #         # TODO: add a flag for this
+    #         mean_reward = self.memory.mean_reward()
+    #         screen.log_title("mean_reward = {}.".format(mean_reward))
+    #         self.mean_reward.add_sample(mean_reward)
+    #
+    #     self.phase = RunPhase.TRAIN
 
     def post_training_commands(self):
         pass
 
-    def improve(self):
-        """
-        Training algorithms wrapper. Heatup >> [ Evaluate >> Play >> Train >> Save checkpoint ]
+    def save_checkpoint(self, model_id: str="checkpoint"):
+        # TODO: define this as a global saving function and not per network saving function
+        if self.ap.task_parameters.save_model_dir:
+            list(self.networks.values())[0].network_parameters.save_model_dir = self.ap.task_parameters.save_model_dir
+            list(self.networks.values())[0].save_model(model_id)
 
+    def get_predictions(self, states: List[Dict[str, np.ndarray]], prediction_type: PredictionType):
+        """
+        Get a prediction from the agent with regard to the requested prediction_type.
+        If the agent cannot predict this type of prediction_type, or if there is more than possible way to do so,
+        raise a ValueException.
+        :param states:
+        :param prediction_type:
+        :return:
+        """
+
+        predictions = self.networks['main'].online_network.predict_with_prediction_type(
+            # states=self.dict_state_to_batches_dict(states, 'main'), prediction_type=prediction_type)
+            states=states, prediction_type=prediction_type)
+
+        if len(predictions.keys()) != 1:
+            raise ValueError("The network has more than one component {} matching the requested prediction_type {}. ".
+                             format(list(predictions.keys()), prediction_type))
+        return list(predictions.values())[0]
+
+    def sync(self) -> None:
+        """
+        Sync the global network parameters to local networks
         :return: None
         """
-
-        # synchronize the online network weights with the global network
-        for network in self.networks:
+        for network in self.networks.values():
             network.sync()
 
-        # heatup phase
-        if self.tp.num_heatup_steps != 0:
-            self.in_heatup = True
-            screen.log_title("Starting heatup {}".format(self.task_id))
-            num_steps_required_for_one_training_batch = self.tp.batch_size * self.tp.env.observation_stack_size
-            for step in range(max(self.tp.num_heatup_steps, num_steps_required_for_one_training_batch)):
-                self.act(phase=RunPhase.HEATUP)
 
-        # training phase
-        self.in_heatup = False
-        screen.log_title("Starting training {}".format(self.task_id))
-        self.exploration_policy.change_phase(RunPhase.TRAIN)
-        training_start_time = time.time()
-        model_snapshots_periods_passed = -1
-        self.reset_game()
 
-        while self.training_iteration < self.tp.num_training_iterations:
-            # evaluate
-            evaluate_agent = (self.last_episode_evaluation_ran is not self.current_episode) and \
-                             (self.current_episode % self.tp.evaluate_every_x_episodes == 0)
-            evaluate_agent = evaluate_agent or \
-                             (self.imitation and self.training_iteration > 0 and
-                              self.training_iteration % self.tp.evaluate_every_x_training_iterations == 0)
 
-            if evaluate_agent:
-                self.env.reset(force_environment_reset=True)
-                self.last_episode_evaluation_ran = self.current_episode
-                self.evaluate(self.tp.evaluation_episodes)
 
-            # snapshot model
-            if self.tp.save_model_sec and self.tp.save_model_sec > 0 and not self.tp.distributed:
-                total_training_time = time.time() - training_start_time
-                current_snapshot_period = (int(total_training_time) // self.tp.save_model_sec)
-                if current_snapshot_period > model_snapshots_periods_passed:
-                    model_snapshots_periods_passed = current_snapshot_period
-                    self.save_model(model_snapshots_periods_passed)
-                    if hasattr(self, 'running_observation_state') and self.running_observation_stats is not None:
-                        to_pickle(self.running_observation_stats,
-                                  os.path.join(self.tp.save_model_dir,
-                                               "running_stats.p".format(model_snapshots_periods_passed)))
-
-            # play and record in replay buffer
-            if self.tp.agent.collect_new_data:
-                if self.tp.agent.step_until_collecting_full_episodes:
-                    step = 0
-                    while step < self.tp.agent.num_consecutive_playing_steps or self.memory.get_episode(-1).length() != 0:
-                        self.act()
-                        step += 1
-                else:
-                    for step in range(self.tp.agent.num_consecutive_playing_steps):
-                        self.act()
-
-            # train
-            if self.tp.train:
-                for step in range(self.tp.agent.num_consecutive_training_steps):
-                    loss = self.train()
-                    self.loss.add_sample(loss)
-                    self.training_iteration += 1
-                    if self.imitation:
-                        self.log_to_screen(RunPhase.TRAIN)
-                self.post_training_commands()
-
-    def save_model(self, model_id):
-        self.main_network.save_model(model_id)

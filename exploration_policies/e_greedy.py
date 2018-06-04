@@ -14,57 +14,63 @@
 # limitations under the License.
 #
 
-from exploration_policies.exploration_policy import *
+from exploration_policies.exploration_policy import ExplorationPolicy
+from schedules import Schedule, LinearSchedule
+from spaces import ActionSpace, Discrete, Box
+import numpy as np
+from core_types import RunPhase, ActionType
+from typing import List
+from exploration_policies.exploration_policy import ExplorationParameters
+
+
+class EGreedyParameters(ExplorationParameters):
+    def __init__(self):
+        super().__init__()
+        self.epsilon_schedule = LinearSchedule(0.5, 0.01, 50000)
+        self.evaluation_epsilon = 0.05
+        self.noise_percentage_schedule = LinearSchedule(0.1, 0.1, 50000) # for continuous control -
+        # (see http://www.cs.ubc.ca/~van/papers/2017-TOG-deepLoco/2017-TOG-deepLoco.pdf)
+
+    @property
+    def path(self):
+        return 'exploration_policies.e_greedy:EGreedy'
 
 
 class EGreedy(ExplorationPolicy):
-    def __init__(self, tuning_parameters):
+    def __init__(self, action_space: ActionSpace, epsilon_schedule: Schedule,
+                 evaluation_epsilon: float, noise_percentage_schedule: Schedule=None):
         """
-        :param tuning_parameters: A Preset class instance with all the running paramaters
-        :type tuning_parameters: Preset
+        :param action_space: the action space used by the environment
+        :param epsilon_schedule: a schedule for the epsilon values
+        :param evaluation_epsilon: the epsilon value to use for evaluation phases
+        :param noise_percentage_schedule: a schedule for the noise percentage values
         """
-        ExplorationPolicy.__init__(self, tuning_parameters)
-        self.epsilon = tuning_parameters.exploration.initial_epsilon
-        self.final_epsilon = tuning_parameters.exploration.final_epsilon
-        self.epsilon_decay_delta = (
-                                   tuning_parameters.exploration.initial_epsilon - tuning_parameters.exploration.final_epsilon) \
-                                   / float(tuning_parameters.exploration.epsilon_decay_steps)
-        self.evaluation_epsilon = tuning_parameters.exploration.evaluation_epsilon
-
+        ExplorationPolicy.__init__(self, action_space)
+        self.epsilon_schedule = epsilon_schedule
+        self.evaluation_epsilon = evaluation_epsilon
         # for continuous e-greedy (see http://www.cs.ubc.ca/~van/papers/2017-TOG-deepLoco/2017-TOG-deepLoco.pdf)
-        self.variance = tuning_parameters.exploration.initial_noise_variance_percentage
-        self.final_variance = tuning_parameters.exploration.final_noise_variance_percentage
-        self.decay_steps = tuning_parameters.exploration.noise_variance_decay_steps
-        self.variance_decay_delta = (self.variance - self.final_variance) / float(self.decay_steps)
+        self.variance_schedule = noise_percentage_schedule
 
-    def decay_exploration(self):
-        # decay epsilon
-        if self.epsilon > self.final_epsilon:
-            self.epsilon -= self.epsilon_decay_delta
-        elif self.epsilon < self.final_epsilon:
-            self.epsilon = self.final_epsilon
+        if type(action_space) == Box and noise_percentage_schedule is None:
+            raise ValueError("For continuous controls, the noise schedule should be supplied to the exploration policy")
 
-        # decay noise variance
-        if not self.discrete_controls:
-            if self.variance > self.final_variance:
-                self.variance -= self.variance_decay_delta
-            elif self.variance < self.final_variance:
-                self.variance = self.final_variance
-
-    def get_action(self, action_values):
+    def get_action(self, action_values: List[ActionType]) -> ActionType:
         if self.phase == RunPhase.TRAIN:
-            self.decay_exploration()
-        epsilon = self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon
+            self.epsilon_schedule.step()
+            if self.variance_schedule:
+                self.variance_schedule.step()
+        epsilon = self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value
 
-        if self.discrete_controls:
+        if isinstance(self.action_space, Discrete):
             top_action = np.argmax(action_values)
             if np.random.rand() < epsilon:
-                return np.random.randint(self.action_space_size)
+                return self.action_space.sample()
             else:
                 return top_action
         else:
-            noise = np.random.randn(1, self.action_space_size) * self.variance * self.action_abs_range
+            noise = np.random.randn(1, self.action_space.shape) * self.variance_schedule.current_value * \
+                    self.action_space.max_abs_range
             return np.squeeze(action_values + (np.random.rand() < epsilon) * noise)
 
     def get_control_param(self):
-        return self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon
+        return self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value

@@ -50,9 +50,6 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--verbose',
                         help="(flag) display verbose logs in the event of an error",
                         action='store_true')
-    parser.add_argument('-l', '--list_presets',
-                        help="(flag) list all the presets that are tested",
-                        action='store_true')
     parser.add_argument('--stop_after_first_failure',
                         help="(flag) stop executing tests after the first error",
                         action='store_true')
@@ -76,21 +73,13 @@ if __name__ == '__main__':
         presets_to_ignore = args.ignore_presets.split(',')
     else:
         presets_to_ignore = []
-
-    if args.list_presets:
-        for idx, preset_name in enumerate(presets_lists):
-            preset = eval('presets.{}()'.format(preset_name))
-            if preset.test and preset_name not in presets_to_ignore:
-                print(preset_name)
-        exit(0)
-
     for idx, preset_name in enumerate(presets_lists):
         preset = eval('presets.{}()'.format(preset_name))
         if preset.test and preset_name not in presets_to_ignore:
             frameworks = []
-            if preset.agent.tensorflow_support and not args.ignore_tensorflow:
+            if preset.agent.tensorflow_support and not args.ignore_tensorflow:  # TODO: fix this
                 frameworks.append('tensorflow')
-            if preset.agent.neon_support and not args.ignore_neon:
+            if preset.agent.neon_support and not args.ignore_neon:     # TODO: fix this
                 frameworks.append('neon')
 
             for framework in frameworks:
@@ -111,7 +100,7 @@ if __name__ == '__main__':
                     '-f {framework} '
                     '-e {test_name} '
                     '-n {num_workers} '
-                    '-cp "seed=0" '
+                    '--seed 0'
                     '&> {log_file_name} '
                 ).format(
                     preset_name=preset_name,

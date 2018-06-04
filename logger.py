@@ -13,19 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
-from pandas import *
+import atexit
+from pandas import DataFrame
 import os
-import re
-from pprint import pprint
-import threading
 from subprocess import Popen, PIPE
 import time
 import datetime
 from six.moves import input
 from PIL import Image
-from typing import Union
 import shutil
+import re
+from typing import Union
+import json
 
 global failed_imports
 failed_imports = []
@@ -85,12 +84,13 @@ class ScreenLogger(object):
     def error(self, text, crash=True):
         print("{}{}{}".format(Colors.RED, text, Colors.END))
         if crash:
+            atexit.unregister(summarize_experiment)
             exit(1)
 
     def ask_input(self, title):
         return input("{}{}{}".format(Colors.BG_CYAN, title, Colors.END))
 
-    def ask_yes_no(self, title: str, default: Union[None, bool]=None):
+    def ask_yes_no(self, title: str, default: Union[None, bool] = None):
         """
         Ask the user for a yes / no question and return True if the answer is yes and False otherwise.
         The function will keep asking the user for an answer until he answers one of the possible responses.
@@ -126,77 +126,22 @@ class ScreenLogger(object):
 
 class BaseLogger(object):
     def __init__(self):
-        pass
-
-    def set_current_time(self, time):
-        pass
-
-    def set_dump_dir(self, path, task_id):
-        pass
-
-    def create_signal_value(self, signal_name, value, overwrite=True, time=None):
-        pass
-
-    def change_signal_value(self, signal_name, time, value):
-        pass
-
-    def signal_value_exists(self, time, signal_name):
-        pass
-
-    def get_signal_value(self, time, signal_name):
-        pass
-
-    def dump_output_csv(self):
-        pass
-
-    def update_wall_clock_time(self, episode):
-        pass
-
-
-class Logger(BaseLogger):
-    def __init__(self):
-        BaseLogger.__init__(self)
         self.data = DataFrame()
         self.csv_path = ''
-        self.doc_path = ''
-        self.aggregated_data_across_threads = None
-        self.time_started = datetime.datetime.now()
         self.start_time = None
         self.time = None
         self.experiments_path = ""
         self.last_line_idx_written_to_csv = 0
         self.experiment_name = ""
+        self.index_name = "Index"
 
     def set_current_time(self, time):
         self.time = time
 
-    def two_digits(self, num):
-        return '%02d' % num
-
-    def set_dump_dir(self, experiments_path, task_id=None, add_timestamp=False, filename='worker'):
-        self.experiments_path = experiments_path
-
-        # set file names
-        if task_id is not None:
-            filename += "_{}".format(task_id)
-
-        # add timestamp
-        if add_timestamp:
-            t = self.time_started.time()
-            d = self.time_started.date()
-            filename += '_{}_{}_{}-{}_{}'.format(self.two_digits(d.day), self.two_digits(d.month),
-                                                 d.year, self.two_digits(t.hour), self.two_digits(t.minute))
-
-        # add an index to the file in case there is already an experiment running with the same timestamp
-        path_exists = True
-        idx = 0
-        while path_exists:
-            self.csv_path = os.path.join(experiments_path, '{}_{}.csv'.format(filename, idx))
-            self.doc_path = os.path.join(experiments_path, '{}_{}.doc'.format(filename, idx))
-            path_exists = os.path.exists(self.csv_path) or os.path.exists(self.doc_path)
-            idx += 1
-
     def create_signal_value(self, signal_name, value, overwrite=True, time=None):
+        if self.last_line_idx_written_to_csv != 0:
+            assert signal_name in self.data.columns
+
         if not time:
             time = self.time
         # create only if it doesn't already exist
@@ -225,7 +170,7 @@ class Logger(BaseLogger):
         return self.data.loc[time, signal_name]
 
     def dump_output_csv(self, append=True):
-        self.data.index.name = "Episode #"
+        self.data.index.name = self.index_name
         if len(self.data.index) == 1:
             self.start_time = time.time()
 
@@ -236,85 +181,196 @@ class Logger(BaseLogger):
 
         self.last_line_idx_written_to_csv = len(self.data.index)
 
-    def update_wall_clock_time(self, episode):
+    def update_wall_clock_time(self, index):
         if self.start_time:
-            self.create_signal_value('Wall-Clock Time', time.time() - self.start_time, time=episode)
+            self.create_signal_value('Wall-Clock Time', time.time() - self.start_time, time=index)
         else:
-            self.create_signal_value('Wall-Clock Time', 0, time=episode)
+            self.create_signal_value('Wall-Clock Time', 0, time=index)
             self.start_time = time.time()
 
-    def create_gif(self, images, fps=10, name="Gif"):
-        output_file = '{}_{}.gif'.format(datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S'), name)
-        output_dir = os.path.join(self.experiments_path, 'gifs')
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        output_path = os.path.join(output_dir, output_file)
-        pil_images = [Image.fromarray(image) for image in images]
-        pil_images[0].save(output_path, save_all=True, append_images=pil_images[1:], duration=1.0 / fps, loop=0)
 
-    def remove_experiment_dir(self):
-        shutil.rmtree(self.experiments_path)
+class EpisodeLogger(BaseLogger):
+    def __init__(self):
+        super().__init__()
+        self.worker_dir_path = ''
+        self.index_name = "Episode Steps"
 
-    def summarize_experiment(self):
-        screen.separator()
-        screen.log_title("Results stored at: {}".format(self.experiments_path))
-        screen.log_title("Total runtime: {}".format(datetime.datetime.now() - self.time_started))
-        if 'Training Reward' in self.data.keys() and 'Evaluation Reward' in self.data.keys():
-            screen.log_title("Max training reward: {}, max evaluation reward: {}".format(self.data['Training Reward'].max(), self.data['Evaluation Reward'].max()))
-        screen.separator()
-        if screen.ask_yes_no("Do you want to discard the experiment results (Warning: this cannot be undone)?", False):
-            self.remove_experiment_dir()
-        elif screen.ask_yes_no("Do you want to specify a different experiment name to save to?", False):
-            new_name = self.get_experiment_name()
-            new_path = self.get_experiment_path(new_name, create_path=False)
-            shutil.move(self.experiments_path, new_path)
-            screen.log_title("Results moved to: {}".format(new_path))
+    def set_logger_filenames(self, _experiments_path, logger_prefix='', task_id=None, add_timestamp=False, filename=''):
+        self.experiments_path = _experiments_path
 
-    def get_experiment_name(self, initial_experiment_name=''):
-        match = None
-        while match is None:
-            if initial_experiment_name == '':
-                experiment_name = screen.ask_input("Please enter an experiment name: ")
-            else:
-                experiment_name = initial_experiment_name
+        # set file names
+        if task_id is not None:
+            filename += "block_{}.".format(task_id)
 
-            experiment_name = experiment_name.replace(" ", "_")
-            match = re.match("^$|^[\w -/]{1,100}$", experiment_name)
+        # add timestamp
+        if add_timestamp:
+            filename += logger_prefix
 
-            if match is None:
-                screen.error('Experiment name must be composed only of alphanumeric letters, '
-                             'underscores and dashes and should not be longer than 100 characters.')
+        self.worker_dir_path = os.path.join(_experiments_path, '{}'.format(filename))
+        if not os.path.exists(self.worker_dir_path):
+            os.makedirs(self.worker_dir_path)
 
-        self.experiment_name = match.group(0)
-        return self.experiment_name
-
-    def get_experiment_path(self, experiment_name, create_path=True):
-        general_experiments_path = os.path.join('./experiments/', experiment_name)
-
-        cur_date = self.time_started.date()
-        cur_time = self.time_started.time()
-
-        if not os.path.exists(general_experiments_path) and create_path:
-            os.makedirs(general_experiments_path)
-        experiment_path = os.path.join(general_experiments_path, '{}_{}_{}-{}_{}'
-                                       .format(logger.two_digits(cur_date.day), logger.two_digits(cur_date.month),
-                                               cur_date.year, logger.two_digits(cur_time.hour),
-                                               logger.two_digits(cur_time.minute)))
-        i = 0
-        while True:
-            if os.path.exists(experiment_path):
-                experiment_path = os.path.join(general_experiments_path, '{}_{}_{}-{}_{}_{}'
-                                               .format(cur_date.day, cur_date.month, cur_date.year, cur_time.hour,
-                                                       cur_time.minute, i))
-                i += 1
-            else:
-                if create_path:
-                    os.makedirs(experiment_path)
-                return experiment_path
+    def set_episode_idx(self, episode_idx):
+        self.data = DataFrame()
+        self.csv_path = os.path.join(self.worker_dir_path, 'episode_{}.csv'.format(episode_idx))
+        self.last_line_idx_written_to_csv = 0
 
 
-global logger
-logger = Logger()
+class Logger(BaseLogger):
+    def __init__(self):
+        super().__init__()
+        self.doc_path = ''
+        self.index_name = 'Episode #'
+
+    def set_logger_filenames(self, _experiments_path, logger_prefix='', task_id=None, add_timestamp=False, filename=''):
+        self.experiments_path = _experiments_path
+
+        # set file names
+        if task_id is not None:
+            filename += "block_{}.".format(task_id)
+
+        # add timestamp
+        if add_timestamp:
+            filename += logger_prefix
+
+        # add an index to the file in case there is already an experiment running with the same timestamp
+        path_exists = True
+        idx = 0
+        while path_exists:
+            self.csv_path = os.path.join(_experiments_path, '{}_{}.csv'.format(filename, idx))
+            self.doc_path = os.path.join(_experiments_path, '{}_{}.json'.format(filename, idx))
+            path_exists = os.path.exists(self.csv_path) or os.path.exists(self.doc_path)
+            idx += 1
+
+    def dump_documentation(self, parameters):
+        with open(self.doc_path, 'w') as outfile:
+            outfile.write(parameters)
+
+
+#######################################################################################################################
+#################################### Module Related Methods/Vars ######################################################
+#######################################################################################################################
+
+global experiment_path
+experiment_path = None
+
+global experiment_name
+experiment_name = None
+time_started = datetime.datetime.now()
+
+
+def two_digits(num):
+    return '%02d' % num
+
+
+def create_gif(images, fps=10, name="Gif"):
+    global experiment_path
+
+    output_file = '{}_{}.gif'.format(datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S'), name)
+    output_dir = os.path.join(experiment_path, 'gifs')
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    output_path = os.path.join(output_dir, output_file)
+    pil_images = [Image.fromarray(image) for image in images]
+    pil_images[0].save(output_path, save_all=True, append_images=pil_images[1:], duration=1.0 / fps, loop=0)
+
+
+def create_mp4(images, fps=10, name="mp4"):
+    global experiment_path
+
+    output_file = '{}_{}.mp4'.format(datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S'), name)
+    output_dir = os.path.join(experiment_path, 'videos')
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    output_path = os.path.join(output_dir, output_file)
+    shape = 'x'.join([str(d) for d in images[0].shape[:2][::-1]])
+    command = ['ffmpeg',
+               '-y',
+               '-f', 'rawvideo',
+               '-s', shape,
+               '-pix_fmt', 'rgb24',
+               '-r', str(fps),
+               '-i', '-',
+               '-vcodec', 'libx264',
+               '-pix_fmt', 'yuv420p',
+               output_path]
+
+    p = Popen(command, stdin=PIPE, stderr=PIPE)
+    for image in images:
+        p.stdin.write(image.tostring())
+    p.stdin.close()
+    p.wait()
+
+
+def remove_experiment_dir():
+    shutil.rmtree(experiment_path)
+
+
+def summarize_experiment():
+    screen.separator()
+    screen.log_title("Results stored at: {}".format(experiment_path))
+    screen.log_title("Total runtime: {}".format(datetime.datetime.now() - time_started))
+    # TODO - bring me back to life
+    # if 'Training Reward' in self.data.keys() and 'Evaluation Reward' in self.data.keys():
+    #     screen.log_title("Max training reward: {}, max evaluation reward: {}".format(
+    # self.data['Training Reward'].max(), self.data['Evaluation Reward'].max()))
+    screen.separator()
+    if screen.ask_yes_no("Do you want to discard the experiment results (Warning: this cannot be undone)?", False):
+        remove_experiment_dir()
+    elif screen.ask_yes_no("Do you want to specify a different experiment name to save to?", False):
+        new_name = get_experiment_name()
+        old_path = experiment_path
+        new_path = get_experiment_path(new_name, create_path=False)
+        shutil.move(old_path, new_path)
+        screen.log_title("Results moved to: {}".format(new_path))
+
+
+def get_experiment_name(initial_experiment_name=''):
+    global experiment_name
+
+    match = None
+    while match is None:
+        if initial_experiment_name == '':
+            experiment_name = screen.ask_input("Please enter an experiment name: ")
+        else:
+            experiment_name = initial_experiment_name
+
+        experiment_name = experiment_name.replace(" ", "_")
+        match = re.match("^$|^[\w -/]{1,1000}$", experiment_name)
+
+        if match is None:
+            screen.error('Experiment name must be composed only of alphanumeric letters, '
+                         'underscores and dashes and should not be longer than 1000 characters.')
+
+    experiment_name = match.group(0)
+    return experiment_name
+
+
+def get_experiment_path(experiment_name, create_path=True):
+    global experiment_path
+
+    general_experiments_path = os.path.join('./experiments/', experiment_name)
+
+    cur_date = time_started.date()
+    cur_time = time_started.time()
+
+    if not os.path.exists(general_experiments_path) and create_path:
+        os.makedirs(general_experiments_path)
+    experiment_path = os.path.join(general_experiments_path, '{}_{}_{}-{}_{}'
+                                   .format(two_digits(cur_date.day), two_digits(cur_date.month),
+                                           cur_date.year, two_digits(cur_time.hour),
+                                           two_digits(cur_time.minute)))
+    i = 0
+    while True:
+        if os.path.exists(experiment_path):
+            experiment_path = os.path.join(general_experiments_path, '{}_{}_{}-{}_{}_{}'
+                                           .format(cur_date.day, cur_date.month, cur_date.year, cur_time.hour,
+                                                   cur_time.minute, i))
+            i += 1
+        else:
+            if create_path:
+                os.makedirs(experiment_path)
+            return experiment_path
 
 global screen
 screen = ScreenLogger("")

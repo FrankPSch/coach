@@ -14,615 +14,386 @@
 # limitations under the License.
 #
 
-from utils import Enum
+
+from enum import Enum
+import utils
 import json
 import types
+from collections import OrderedDict
+from typing import Dict, List, Union
+from core_types import GoalTypes, TrainingSteps, EnvironmentSteps
+import sys
+import ast
 
 
-class Frameworks(Enum):
-    TensorFlow = 1
-    Neon = 2
+# TODO: this function is not working correctly anymore + is duplicated in presets
+def json_to_preset(json_path):
+    with open(json_path, 'r') as json_file:
+        run_dict = json.loads(json_file.read())
+
+    if run_dict['preset'] is None:
+        tuning_parameters = Preset(eval(run_dict['agent_type']), eval(run_dict['environment_type']),
+                                   eval(run_dict['exploration_policy_type']))
+    else:
+        tuning_parameters = eval(run_dict['preset'])()
+        # Override existing parts of the preset
+        if run_dict['agent_type'] is not None:
+            tuning_parameters.agent = eval(run_dict['agent_type'])()
+
+        if run_dict['environment_type'] is not None:
+            tuning_parameters.env = eval(run_dict['environment_type'])()
+
+        if run_dict['exploration_policy_type'] is not None:
+            tuning_parameters.exploration = eval(run_dict['exploration_policy_type'])()
+
+    # human control
+    if run_dict['play']:
+        tuning_parameters.agent.type = 'HumanAgent'
+        tuning_parameters.env.human_control = True
+        tuning_parameters.num_heatup_steps = 0
+
+    if run_dict['level']:
+        tuning_parameters.env.level = run_dict['level']
+
+    if run_dict['custom_parameter'] is not None:
+        unstripped_key_value_pairs = [pair.split('=') for pair in run_dict['custom_parameter'].split(';')]
+        stripped_key_value_pairs = [tuple([pair[0].strip(), ast.literal_eval(pair[1].strip())]) for pair in
+                                    unstripped_key_value_pairs]
+
+        # load custom parameters into run_dict
+        for key, value in stripped_key_value_pairs:
+            run_dict[key] = value
+
+    for key in ['agent_type', 'environment_type', 'exploration_policy_type', 'preset', 'custom_parameter']:
+        run_dict.pop(key, None)
+
+    # load parameters from run_dict to tuning_parameters
+    for key, value in run_dict.items():
+        if ((sys.version_info[0] == 2 and type(value) == unicode) or
+                (sys.version_info[0] == 3 and type(value) == str)):
+            value = '"{}"'.format(value)
+        exec('tuning_parameters.{} = {}'.format(key, value)) in globals(), locals()
+
+    return tuning_parameters
+
+
+class Frameworks(utils.Enum):
+    TensorFlow = "TensorFlow"
+    Neon = "neon"
 
 
 class InputTypes(object):
-    Observation = 1
-    Measurements = 2
-    GoalVector = 3
-    Action = 4
-    TimedObservation = 5
+    Observation = "Observation"
+    Measurements = "Measurements"
+    GoalVector = "GoalVector"
+    Action = "Action"
+    TimedObservation = "TimedObservation"
+    ObservationIdentity = "ObservationIdentity"
+    GoalIdentity = "GoalIdentity"
+
+
+class EmbedderScheme(Enum):
+    Empty = "Empty"
+    Shallow = "Shallow"
+    Medium = "Medium"
+    Deep = "Deep"
 
 
 class OutputTypes(object):
-    Q = 1
-    DuelingQ = 2
-    V = 3
-    Pi = 4
-    MeasurementsPrediction = 5
-    DNDQ = 6
-    NAF = 7
-    PPO = 8
-    PPO_V = 9
-    CategoricalQ = 10
-    QuantileRegressionQ = 11
-
-
-
-class EmbedderDepth(object):
-    Shallow = 1
-    Deep = 2
-
-
-class EmbedderWidth(object):
-    Narrow = 1
-    Wide = 2
+    Q = 'q_head:QHead'
+    DuelingQ = 'dueling_q_head:DuelingQHead'
+    V = 'v_head:VHead'
+    Pi = 'policy_head:PolicyHead'
+    MeasurementsPrediction = 'measurements_prediction_head:MeasurementsPredictionHead'
+    DNDQ = 'dnd_q_head:DNDQHead'
+    NAF = 'naf_head:NAFHead'
+    PPO = 'ppo_head:PPOHead'
+    PPO_V = 'ppo_v_head:PPOVHead'
+    CategoricalQ = 'categorical_q_head:CategoricalQHead'
+    QuantileRegressionQ = 'quantile_regression_q_head:QuantileRegressionQHead'
+    GoalMapping = 'goal_mapping_head:GoalMappingHead'
 
 
 class MiddlewareTypes(object):
-    LSTM = 1
-    FC = 2
+    LSTM = 'lstm_embedder:LSTM_Embedder'
+    FC = 'fc_embedder:FC_Embedder'
+
+
+def iterable_to_items(obj):
+    if isinstance(obj, dict) or isinstance(obj, OrderedDict) or isinstance(obj, types.MappingProxyType):
+        items = obj.items()
+    elif isinstance(obj, list):
+        items = enumerate(obj)
+    else:
+        raise ValueError("The given object is not a dict or a list")
+    return items
+
+
+def unfold_dict_or_list(obj: Union[Dict, List, OrderedDict]):
+    """
+    Recursively unfolds all the parameters in dictionaries and lists
+    :param obj: a dictionary or list to unfold
+    :return: the unfolded parameters dictionary
+    """
+    parameters = OrderedDict()
+    items = iterable_to_items(obj)
+    for k, v in items:
+        if isinstance(v, dict) or isinstance(v, list) or isinstance(v, OrderedDict):
+            if 'tensorflow.' not in str(v.__class__):
+                parameters[k] = unfold_dict_or_list(v)
+        elif 'tensorflow.' in str(v.__class__):
+            parameters[k] = v
+        elif hasattr(v, '__dict__'):
+            sub_params = v.__dict__
+            if '__objclass__' not in sub_params.keys():
+                try:
+                    parameters[k] = unfold_dict_or_list(sub_params)
+                except RecursionError:
+                    parameters[k] = sub_params
+                parameters[k]['__class__'] = v.__class__.__name__
+            else:
+                # unfolding this type of object will result in infinite recursion
+                parameters[k] = sub_params
+        else:
+            parameters[k] = v
+    if not isinstance(obj, OrderedDict) and not isinstance(obj, list):
+        parameters = OrderedDict(sorted(parameters.items()))
+    return parameters
 
 
 class Parameters(object):
+    def __setattr__(self, key, value):
+        caller_name = sys._getframe(1).f_code.co_name
+
+        if caller_name != '__init__' and not hasattr(self, key):
+            raise TypeError("Parameter '{}' does not exist in {}. Parameters are only to be defined in a constructor of"
+                            " a class inheriting from Parameters. In order to explicitly register a new parameter "
+                            "outside of a constructor use register_var().".
+                            format(key, self.__class__))
+        object.__setattr__(self, key, value)
+
+    def register_var(self, key, value):
+        if hasattr(self, key):
+            raise TypeError("Cannot register an already existing parameter '{}'. ".format(key))
+        object.__setattr__(self, key, value)
+
     def __str__(self):
-        parameters = {}
-        for k, v in self.__dict__.items():
-            if isinstance(v, type) and issubclass(v, Parameters):
-                # v.__dict__ doesn't return a dictionary but a mappingproxy
-                # which json doesn't serialize, so convert it into a normal
-                # dictionary
-                parameters[k] = dict(v.__dict__.items())
-            elif isinstance(v, types.MappingProxyType):
-                parameters[k] = dict(v.items())
-            else:
-                parameters[k] = v
-
-        return json.dumps(parameters, indent=4, default=repr)
+        result = "\"{}\" {}\n".format(self.__class__.__name__,
+                                   json.dumps(unfold_dict_or_list(self.__dict__), indent=4, default=repr))
+        return result
 
 
-class AgentParameters(Parameters):
-    agent = ''
+class AlgorithmParameters(Parameters):
+    def __init__(self):
+        # Architecture parameters
+        self.use_accumulated_reward_as_measurement = False
+        self.add_a_normalized_timestep_to_the_observation = False
 
-    # Architecture parameters
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    middleware_type = MiddlewareTypes.FC
-    loss_weights = [1.0]
-    stop_gradients_from_head = [False]
-    embedder_depth = EmbedderDepth.Shallow
-    embedder_width = EmbedderWidth.Wide
-    num_output_head_copies = 1
-    use_measurements = False
-    use_accumulated_reward_as_measurement = False
-    add_a_normalized_timestep_to_the_observation = False
-    l2_regularization = 0
-    hidden_layers_activation_function = 'relu'
-    optimizer_type = 'Adam'
-    async_training = False
-    use_separate_networks_per_head = False
+        # Agent parameters
+        self.num_consecutive_playing_steps = EnvironmentSteps(1)
+        self.num_consecutive_training_steps = 1  # TODO: update this to TrainingSteps
 
-    # Agent parameters
-    num_consecutive_playing_steps = 1
-    num_consecutive_training_steps = 1
-    update_evaluation_agent_network_after_every_num_steps = 3000
-    bootstrap_total_return_from_old_policy = False
-    n_step = -1
-    num_episodes_in_experience_replay = 200
-    num_transitions_in_experience_replay = None
-    discount = 0.99
-    policy_gradient_rescaler = 'A_VALUE'
-    apply_gradients_every_x_episodes = 5
-    beta_entropy = 0
-    num_steps_between_gradient_updates = 20000  # t_max
-    num_steps_between_copying_online_weights_to_target = 1000
-    rate_for_copying_weights_to_target = 1.0
-    monte_carlo_mixing_rate = 0.1
-    gae_lambda = 0.96
-    step_until_collecting_full_episodes = False
-    targets_horizon = 'N-Step'
-    replace_mse_with_huber_loss = False
-    load_memory_from_file_path = None
-    collect_new_data = True
-    input_rescaler = 255.0
+        self.heatup_using_network_decisions = False
+        self.discount = 0.99
+        self.apply_gradients_every_x_episodes = 5
+        self.num_steps_between_copying_online_weights_to_target = TrainingSteps(1000)
+        self.rate_for_copying_weights_to_target = 1.0
+        # self.targets_horizon = 'N-Step'
+        self.load_memory_from_file_path = None
+        self.collect_new_data = True
 
-    # PPO related params
-    target_kl_divergence = 0.01
-    initial_kl_coefficient = 1.0
-    high_kl_penalty_coefficient = 1000
-    value_targets_mix_fraction = 0.1
-    clip_likelihood_ratio_using_epsilon = None
-    use_kl_regularization = True
-    estimate_value_using_gae = False
+        # HRL / HER related params
+        # self.add_intrinsic_reward_for_reaching_the_goal = False
+        # self.state_value_to_use_as_goal = GoalTypes.Measurements
+        # self.distance_from_goal_threshold = 0.1
+        # self.ignore_extrinsic_reward = False
+        # self.subagent_timestep_limit = 2
+        # self.share_input_embedder_between_subagents = False
+        # self.goal_pooling = 1  # this is used in FeUdal Network
 
-    # DFP related params
-    num_predicted_steps_ahead = 6
-    goal_vector = [1.0, 1.0]
-    future_measurements_weights = [0.5, 0.5, 1.0]
+        # distributed agents params
+        self.shared_optimizer = True
+        self.share_statistics_between_workers = True
 
-    # NEC related params
-    dnd_size = 500000
-    l2_norm_added_delta = 0.001
-    new_value_shift_coefficient = 0.1
-    number_of_knn = 50
-    DND_key_error_threshold = 0.01
-
-    # Framework support
-    neon_support = False
-    tensorflow_support = True
-
-    # distributed agents params
-    shared_optimizer = True
-    share_statistics_between_workers = True
-
-
-class EnvironmentParameters(Parameters):
-    type = 'Doom'
-    level = 'basic'
-    observation_stack_size = 4
-    frame_skip = 4
-    desired_observation_width = 76
-    desired_observation_height = 60
-    normalize_observation = False
-    crop_observation = False
-    random_initialization_steps = 0
-    reward_scaling = 1.0
-    reward_clipping_min = None
-    reward_clipping_max = None
-    human_control = False
-
-
-class ExplorationParameters(Parameters):
-    # Exploration policies
-    policy = 'EGreedy'
-    evaluation_policy = 'Greedy'
-    # -- bootstrap dqn parameters
-    bootstrapped_data_sharing_probability = 0.5
-    architecture_num_q_heads = 1
-    # -- dropout approximation of thompson sampling parameters
-    dropout_discard_probability = 0
-    initial_keep_probability = 0.0  # unused
-    final_keep_probability = 0.99  # unused
-    keep_probability_decay_steps = 50000  # unused
-    # -- epsilon greedy parameters
-    initial_epsilon = 0.5
-    final_epsilon = 0.01
-    epsilon_decay_steps = 50000
-    evaluation_epsilon = 0.05
-    # -- epsilon greedy at end of episode parameters
-    average_episode_length_over_num_episodes = 20
-    # -- boltzmann softmax parameters
-    initial_temperature = 100.0
-    final_temperature = 1.0
-    temperature_decay_steps = 50000
-    # -- additive noise
-    initial_noise_variance_percentage = 0.1
-    final_noise_variance_percentage = 0.1
-    noise_variance_decay_steps = 1
-    # -- Ornstein-Uhlenbeck process
-    mu = 0
-    theta = 0.15
-    sigma = 0.3
-    dt = 0.01
+        # intrinsic reward
+        self.scale_external_reward_by_intrinsic_reward_value = False
 
 
 class GeneralParameters(Parameters):
-    train = True
-    framework = Frameworks.TensorFlow
-    threads = 1
-    sess = None
+    def __init__(self):
+        super().__init__()
 
-    # distributed training options
-    num_threads = 1
-    synchronize_over_num_threads = 1
-    distributed = False
+        # setting a seed will only work for non-parallel algorithms. Parallel algorithms add uncontrollable noise in
+        # the form of different workers starting at different times, and getting different assignments of CPU
+        # time from the OS.
 
-    # Agent blocks
-    memory = 'EpisodicExperienceReplay'
-    architecture = 'GeneralTensorFlowNetwork'
+        # Testing parameters
+        self.test = False
+        self.test_min_return_threshold = 0
+        self.test_max_step_threshold = 1
+        self.test_num_workers = 1
 
-    # General parameters
-    clip_gradients = None
-    kl_divergence_constraint = 100000
-    num_training_iterations = 10000000000
-    num_heatup_steps = 1000
-    heatup_using_network_decisions = False
-    batch_size = 32
-    save_model_sec = None
-    save_model_dir = None
-    checkpoint_restore_dir = None
-    learning_rate = 0.00025
-    learning_rate_decay_rate = 0
-    learning_rate_decay_steps = 0
-    evaluation_episodes = 5
-    evaluate_every_x_episodes = 1000000
-    evaluate_every_x_training_iterations = 0
-    rescaling_interpolation_type = 'bilinear'
-    current_episode = 0
 
-    # setting a seed will only work for non-parallel algorithms. Parallel algorithms add uncontrollable noise in
-    # the form of different workers starting at different times, and getting different assignments of CPU
-    # time from the OS.
-    seed = None
+class NetworkParameters(Parameters):
+    def __init__(self):
+        super().__init__()
+        self.framework = Frameworks.TensorFlow
+        self.sess = None
 
-    checkpoints_path = ''
+        # hardware parameters
+        self.force_cpu = False
 
-    # Testing parameters
-    test = False
-    test_min_return_threshold = 0
-    test_max_step_threshold = 1
-    test_num_workers = 1
+        # distributed training options
+        self.num_threads = 1
+        self.synchronize_over_num_threads = 1
+        self.distributed = False
+        self.async_training = False
+        self.shared_optimizer = True
+
+        # regularization
+        self.clip_gradients = None
+        self.kl_divergence_constraint = None
+        self.l2_regularization = 0
+
+        # checkpoints
+        self.save_model_sec = None
+        self.save_model_dir = None
+        self.checkpoint_restore_dir = None
+
+        # learning rate
+        self.learning_rate = 0.00025
+        self.learning_rate_decay_rate = 0
+        self.learning_rate_decay_steps = 0
+
+        # structure
+        self.input_types = []
+        self.middleware_type = None
+        self.output_types = []
+        self.num_output_head_copies = 1
+        self.loss_weights = []
+        self.rescale_gradient_from_head_by_factor = [1]
+        self.use_separate_networks_per_head = False
+        self.middleware_hidden_layer_size = 512
+        self.hidden_layers_activation_function = 'relu'
+        self.optimizer_type = 'Adam'
+        self.optimizer_epsilon = 0.0001
+        self.batch_size = 32
+        self.replace_mse_with_huber_loss = False
+        # TODO:should this be 255 even for vector observations?
+        self.input_rescaler = 255.0  # TODO: considering removing this in favor of filters
+        self.create_target_network = False
+
+        # Framework support
+        self.neon_support = False
+        self.tensorflow_support = True
+
+
+class InputEmbedderParameters(Parameters):
+    def __init__(self):
+        super().__init__()
+        self.activation_function = 'relu'
+        self.embedder_scheme = EmbedderScheme.Medium
+        self.embedder_width_multiplier = 1
+        self.use_batchnorm = False
+        self.use_dropout = False
+        self.input_rescaler = 255.0
+        self.name = "embedder"
+
+    @property
+    def path(self):
+        return {
+            "image": 'image_embedder:ImageEmbedder',
+            "vector": 'vector_embedder:VectorEmbedder'
+        }
 
 
 class VisualizationParameters(Parameters):
-    # Visualization parameters
-    record_video_every = 1000
-    video_path = '/home/llt_lab/temp/breakout-videos'
-    plot_action_values_online = False
-    show_saliency_maps_every_num_episodes = 1000000000
-    render_observation = False
-    print_summary = False
-    dump_csv = True
-    dump_signals_to_csv_every_x_episodes = 5
-    render = False
-    dump_gifs = True
-    max_fps_for_human_control = 10
-    tensorboard = False
-
-
-class Roboschool(EnvironmentParameters):
-    type = 'Gym'
-    frame_skip = 1
-    observation_stack_size = 1
-    desired_observation_height = None
-    desired_observation_width = None
-
-
-class GymVectorObservation(EnvironmentParameters):
-    type = 'Gym'
-    frame_skip = 1
-    observation_stack_size = 1
-    desired_observation_height = None
-    desired_observation_width = None
-
-
-class Bullet(EnvironmentParameters):
-    type = 'Bullet'
-    frame_skip = 1
-    observation_stack_size = 1
-    desired_observation_height = None
-    desired_observation_width = None
-
-
-class Atari(EnvironmentParameters):
-    type = 'Gym'
-    frame_skip = 4
-    observation_stack_size = 4
-    desired_observation_height = 84
-    desired_observation_width = 84
-    reward_clipping_max = 1.0
-    reward_clipping_min = -1.0
-    random_initialization_steps = 30
-    crop_observation = False  # in the original paper the observation is cropped but not in the Nature paper
-
-
-class Doom(EnvironmentParameters):
-    type = 'Doom'
-    frame_skip = 4
-    observation_stack_size = 3
-    desired_observation_height = 60
-    desired_observation_width = 76
-
-
-class Carla(EnvironmentParameters):
-    type = 'Carla'
-    frame_skip = 1
-    observation_stack_size = 4
-    desired_observation_height = 128
-    desired_observation_width = 180
-    normalize_observation = False
-    server_height = 256
-    server_width = 360
-    config = 'environments/CarlaSettings.ini'
-    level = 'town1'
-    verbose = True
-    stereo = False
-    semantic_segmentation = False
-    depth = False
-    episode_max_time = 100000  # miliseconds for each episode
-    continuous_to_bool_threshold = 0.5
-    allow_braking = False
-
-
-class Human(AgentParameters):
-    type = 'HumanAgent'
-    num_episodes_in_experience_replay = 10000000
-
-
-class NStepQ(AgentParameters):
-    type = 'NStepQAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    loss_weights = [1.0]
-    optimizer_type = 'Adam'
-    num_steps_between_copying_online_weights_to_target = 1000
-    num_episodes_in_experience_replay = 2
-    apply_gradients_every_x_episodes = 1
-    num_steps_between_gradient_updates = 20  # this is called t_max in all the papers
-    hidden_layers_activation_function = 'elu'
-    targets_horizon = 'N-Step'
-    async_training = True
-    shared_optimizer = True
-
-
-class DQN(AgentParameters):
-    type = 'DQNAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    loss_weights = [1.0]
-    optimizer_type = 'Adam'
-    num_steps_between_copying_online_weights_to_target = 1000
-    neon_support = True
-    async_training = True
-    shared_optimizer = True
-
-
-class DDQN(DQN):
-    type = 'DDQNAgent'
-    num_steps_between_copying_online_weights_to_target = 30000
-
-
-class DuelingDQN(DQN):
-    type = 'DQNAgent'
-    output_types = [OutputTypes.DuelingQ]
-
-
-class BootstrappedDQN(DQN):
-    type = 'BootstrappedDQNAgent'
-    num_output_head_copies = 10
-
-
-class CategoricalDQN(DQN):
-    type = 'CategoricalDQNAgent'
-    output_types = [OutputTypes.CategoricalQ]
-    v_min = -10.0
-    v_max = 10.0
-    atoms = 51
-    neon_support = False
-
-
-class QuantileRegressionDQN(DQN):
-    type = 'QuantileRegressionDQNAgent'
-    output_types = [OutputTypes.QuantileRegressionQ]
-    atoms = 51
-
-
-class NEC(AgentParameters):
-    type = 'NECAgent'
-    optimizer_type = 'Adam'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.DNDQ]
-    loss_weights = [1.0]
-    dnd_size = 500000
-    l2_norm_added_delta = 0.001
-    new_value_shift_coefficient = 0.1  # alpha
-    number_of_knn = 50
-    n_step = 100
-    bootstrap_total_return_from_old_policy = True
-    DND_key_error_threshold = 0
-    input_rescaler = 1.0
-    num_consecutive_playing_steps = 4
-
-
-class ActorCritic(AgentParameters):
-    type = 'ActorCriticAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.V, OutputTypes.Pi]
-    loss_weights = [0.5, 1.0]
-    stop_gradients_from_head = [False, False]
-    num_episodes_in_experience_replay = 2
-    policy_gradient_rescaler = 'A_VALUE'
-    hidden_layers_activation_function = 'elu'
-    apply_gradients_every_x_episodes = 5
-    beta_entropy = 0
-    num_steps_between_gradient_updates = 5000  # this is called t_max in all the papers
-    gae_lambda = 0.96
-    shared_optimizer = True
-    estimate_value_using_gae = False
-    async_training = True
-
-
-class PolicyGradient(AgentParameters):
-    type = 'PolicyGradientsAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Pi]
-    loss_weights = [1.0]
-    num_episodes_in_experience_replay = 2
-    policy_gradient_rescaler = 'FUTURE_RETURN_NORMALIZED_BY_TIMESTEP'
-    apply_gradients_every_x_episodes = 5
-    beta_entropy = 0
-    num_steps_between_gradient_updates = 20000  # this is called t_max in all the papers
-    async_training = True
-
-
-class DDPG(AgentParameters):
-    type = 'DDPGAgent'
-    input_types = {'observation': InputTypes.Observation, 'action': InputTypes.Action}
-    output_types = [OutputTypes.V]  # V is used because we only want a single Q value
-    loss_weights = [1.0]
-    hidden_layers_activation_function = 'relu'
-    num_episodes_in_experience_replay = 10000
-    num_steps_between_copying_online_weights_to_target = 1
-    rate_for_copying_weights_to_target = 0.001
-    shared_optimizer = True
-    async_training = True
-
-
-class DDDPG(AgentParameters):
-    type = 'DDPGAgent'
-    input_types = {'observation': InputTypes.Observation, 'action': InputTypes.Action}
-    output_types = [OutputTypes.V]  # V is used because we only want a single Q value
-    loss_weights = [1.0]
-    hidden_layers_activation_function = 'relu'
-    num_episodes_in_experience_replay = 10000
-    num_steps_between_copying_online_weights_to_target = 10
-    rate_for_copying_weights_to_target = 1
-    shared_optimizer = True
-    async_training = True
-
-
-class NAF(AgentParameters):
-    type = 'NAFAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.NAF]
-    loss_weights = [1.0]
-    hidden_layers_activation_function = 'tanh'
-    num_consecutive_training_steps = 5
-    num_steps_between_copying_online_weights_to_target = 1
-    rate_for_copying_weights_to_target = 0.001
-    optimizer_type = 'RMSProp'
-    async_training = True
-
-
-class PPO(AgentParameters):
-    type = 'PPOAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.V]
-    loss_weights = [1.0]
-    hidden_layers_activation_function = 'tanh'
-    num_episodes_in_experience_replay = 1000000
-    policy_gradient_rescaler = 'A_VALUE'
-    gae_lambda = 0.96
-    target_kl_divergence = 0.01
-    initial_kl_coefficient = 1.0
-    high_kl_penalty_coefficient = 1000
-    add_a_normalized_timestep_to_the_observation = True
-    l2_regularization = 0#1e-3
-    value_targets_mix_fraction = 0.1
-    async_training = True
-    estimate_value_using_gae = True
-    step_until_collecting_full_episodes = True
-
-
-class ClippedPPO(AgentParameters):
-    type = 'ClippedPPOAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.V, OutputTypes.PPO]
-    loss_weights = [0.5, 1.0]
-    stop_gradients_from_head = [False, False]
-    hidden_layers_activation_function = 'tanh'
-    num_episodes_in_experience_replay = 1000000
-    policy_gradient_rescaler = 'GAE'
-    gae_lambda = 0.95
-    target_kl_divergence = 0.01
-    initial_kl_coefficient = 1.0
-    high_kl_penalty_coefficient = 1000
-    add_a_normalized_timestep_to_the_observation = False
-    l2_regularization = 1e-3
-    value_targets_mix_fraction = 0.1
-    clip_likelihood_ratio_using_epsilon = 0.2
-    async_training = False
-    use_kl_regularization = False
-    estimate_value_using_gae = True
-    batch_size = 64
-    use_separate_networks_per_head = True
-    step_until_collecting_full_episodes = True
-    beta_entropy = 0.01
-
-
-class DFP(AgentParameters):
-    type = 'DFPAgent'
-    input_types = {
-        'observation': InputTypes.Observation,
-        'measurements': InputTypes.Measurements,
-        'goal': InputTypes.GoalVector
-    }
-    output_types = [OutputTypes.MeasurementsPrediction]
-    loss_weights = [1.0]
-    use_measurements = True
-    num_predicted_steps_ahead = 6
-    goal_vector = [1.0, 1.0]
-    future_measurements_weights = [0.5, 0.5, 1.0]
-    async_training = True
-
-
-class MMC(AgentParameters):
-    type = 'MixedMonteCarloAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    loss_weights = [1.0]
-    num_steps_between_copying_online_weights_to_target = 1000
-    monte_carlo_mixing_rate = 0.1
-    neon_support = True
-
-
-class PAL(AgentParameters):
-    type = 'PALAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    loss_weights = [1.0]
-    pal_alpha = 0.9
-    persistent_advantage_learning = False
-    num_steps_between_copying_online_weights_to_target = 1000
-    neon_support = True
-
-
-class BC(AgentParameters):
-    type = 'BCAgent'
-    input_types = {'observation': InputTypes.Observation}
-    output_types = [OutputTypes.Q]
-    loss_weights = [1.0]
-    collect_new_data = False
-    evaluate_every_x_training_iterations = 50000
-
-
-class EGreedyExploration(ExplorationParameters):
-    policy = 'EGreedy'
-    initial_epsilon = 0.5
-    final_epsilon = 0.01
-    epsilon_decay_steps = 50000
-    evaluation_epsilon = 0.05
-    initial_noise_variance_percentage = 0.1
-    final_noise_variance_percentage = 0.1
-    noise_variance_decay_steps = 50000
-
-
-class BootstrappedDQNExploration(ExplorationParameters):
-    policy = 'Bootstrapped'
-    architecture_num_q_heads = 10
-    bootstrapped_data_sharing_probability = 0.1
-
-
-class OUExploration(ExplorationParameters):
-    policy = 'OUProcess'
-    mu = 0
-    theta = 0.15
-    sigma = 0.3
-    dt = 0.01
-
-
-class AdditiveNoiseExploration(ExplorationParameters):
-    policy = 'AdditiveNoise'
-    initial_noise_variance_percentage = 0.1
-    final_noise_variance_percentage = 0.1
-    noise_variance_decay_steps = 50000
-
-
-class EntropyExploration(ExplorationParameters):
-    policy = 'ContinuousEntropy'
-
-
-class CategoricalExploration(ExplorationParameters):
-    policy = 'Categorical'
-
-
-class Preset(GeneralParameters):
-    def __init__(self, agent, env, exploration, visualization=VisualizationParameters):
+    def __init__(self):
+        super().__init__()
+        # Visualization parameters
+        self.print_summary = True
+        self.dump_csv = True
+        self.dump_gifs = False
+        self.dump_mp4 = False
+        self.dump_signals_to_csv_every_x_episodes = 5
+        self.dump_in_episode_signals = False
+        self.render = False
+        self.native_rendering = False
+        self.max_fps_for_human_control = 10
+        self.tensorboard = False
+        self.video_dump_methods = []  # a list of dump methods which will be checked one after the other until the first
+                                      # dump method that returns false for should_dump()
+        self.add_rendered_image_to_env_response = False
+
+
+class Human(AlgorithmParameters):
+    def __init__(self):
+        super().__init__()
+        self.type = 'HumanAgent'
+        self.num_episodes_in_experience_replay = 10000000
+
+
+# TODO: where to put this?
+# class DuelingDQN(DQN):
+#     def __init__(self):
+#         super().__init__()
+#         self.type = 'DQNAgent'
+#         self.output_types = [OutputTypes.DuelingQ]
+
+
+class DDDPG(AlgorithmParameters):
+    def __init__(self):
+        super().__init__()
+        self.type = 'DDPGAgent'
+        self.input_types = [InputEmbedderParameters(), InputEmbedderParameters()]
+        self.output_types = [OutputTypes.V]  # V is used because we only want a single Q value
+        self.loss_weights = [1.0]
+        self.hidden_layers_activation_function = 'relu'
+        self.num_episodes_in_experience_replay = 10000
+        self.num_steps_between_copying_online_weights_to_target = 10
+        self.rate_for_copying_weights_to_target = 1
+        self.shared_optimizer = True
+        self.async_training = True
+
+
+class BC(AlgorithmParameters):
+    def __init__(self):
+        super().__init__()
+        self.type = 'BCAgent'
+        self.input_types = [InputEmbedderParameters()]
+        self.output_types = [OutputTypes.Q]
+        self.loss_weights = [1.0]
+        self.collect_new_data = False
+        self.evaluate_every_x_training_iterations = 50000
+
+
+# from exploration_policies.exploration_policy import ExplorationParameters
+# from memories.memory import MemoryParameters
+
+
+class AgentParameters(GeneralParameters):
+    def __init__(self, algorithm: AlgorithmParameters, exploration: 'ExplorationParameters', memory: 'MemoryParameters',
+                 networks: Dict[str, NetworkParameters], visualization: VisualizationParameters=VisualizationParameters()):
         """
-        :type agent: AgentParameters
-        :type env: EnvironmentParameters
-        :type exploration: ExplorationParameters
-        :type visualization: VisualizationParameters
+        :param algorithm: the algorithmic parameters
+        :param exploration: the exploration policy parameters
+        :param memory: the memory module parameters
+        :param networks: the parameters for the networks of the agent
+        :param visualization: the visualization parameters
         """
+        super().__init__()
         self.visualization = visualization
-        self.agent = agent
-        self.env = env
+        self.algorithm = algorithm
         self.exploration = exploration
+        self.memory = memory
+        self.network_wrappers = networks
+        self.input_filter = None
+        self.output_filter = None
+        self.full_name_id = None  # TODO: do we really want to hold this parameters here?
+        self.name = None
+        self.task_parameters = None
+
+    @property
+    def path(self):
+        return 'agents.agent:Agent'
+

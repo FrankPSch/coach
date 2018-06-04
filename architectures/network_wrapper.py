@@ -15,8 +15,12 @@
 #
 
 from collections import OrderedDict
-from configurations import Preset, Frameworks
-from logger import *
+from configurations import Frameworks, AgentParameters
+from logger import failed_imports, screen
+import os
+from spaces import ActionSpace, ObservationSpace, MeasurementsObservationSpace, SpacesDefinition
+from block_factories.block_factory import DistributedTaskParameters
+
 try:
     import tensorflow as tf
     from architectures.tensorflow_components.general_network import GeneralTensorFlowNetwork
@@ -34,59 +38,61 @@ class NetworkWrapper(object):
     Contains multiple networks and managers syncing and gradient updates
     between them.
     """
-    def __init__(self, tuning_parameters, has_target, has_global, name, replicated_device=None, worker_device=None):
-        """
-        :param tuning_parameters:
-        :type tuning_parameters: Preset
-        :param has_target:
-        :param has_global:
-        :param name:
-        :param replicated_device:
-        :param worker_device:
-        """
-        self.tp = tuning_parameters
+    def __init__(self, agent_parameters: AgentParameters, has_target: bool, has_global: bool, name: str,
+                 spaces: SpacesDefinition, replicated_device=None, worker_device=None):
+        self.ap = agent_parameters
+        self.network_parameters = self.ap.network_wrappers[name]
         self.has_target = has_target
         self.has_global = has_global
         self.name = name
-        self.sess = tuning_parameters.sess
+        self.sess = None
 
-        if self.tp.framework == Frameworks.TensorFlow:
+        if self.network_parameters.framework == Frameworks.TensorFlow:
             general_network = GeneralTensorFlowNetwork
-        elif self.tp.framework == Frameworks.Neon:
+        elif self.network_parameters.framework == Frameworks.Neon:
             general_network = GeneralNeonNetwork
         else:
-            raise Exception("{} Framework is not supported".format(Frameworks().to_string(self.tp.framework)))
+            raise Exception("{} Framework is not supported"
+                            .format(Frameworks().to_string(self.network_parameters.framework)))
+        # print(worker_device)
+        with tf.variable_scope("{}/{}".format(self.ap.full_name_id, name)):
 
-        # Global network - the main network shared between threads
-        self.global_network = None
-        if self.has_global:
-            with tf.device(replicated_device):
-                self.global_network = general_network(tuning_parameters, '{}/global'.format(name),
-                                                      network_is_local=False)
+            # Global network - the main network shared between threads
+            self.global_network = None
+            if self.has_global:
+                # we assign the parameters of this network on the parameters server
+                with tf.device(replicated_device):
+                    self.global_network = general_network(agent_parameters=agent_parameters,
+                                                          name='{}/global'.format(name),
+                                                          global_network=None,
+                                                          network_is_local=False,
+                                                          spaces=spaces,
+                                                          network_is_trainable=True)
 
-        # Online network - local copy of the main network used for playing
-        self.online_network = None
-        with tf.device(worker_device):
-            self.online_network = general_network(tuning_parameters, '{}/online'.format(name),
-                                                  self.global_network, network_is_local=True)
-
-        # Target network - a local, slow updating network used for stabilizing the learning
-        self.target_network = None
-        if self.has_target:
+            # Online network - local copy of the main network used for playing
+            self.online_network = None
             with tf.device(worker_device):
-                self.target_network = general_network(tuning_parameters, '{}/target'.format(name),
-                                                      network_is_local=True)
+                self.online_network = general_network(agent_parameters=agent_parameters,
+                                                      name='{}/online'.format(name),
+                                                      global_network=self.global_network,
+                                                      network_is_local=True,
+                                                      spaces=spaces,
+                                                      network_is_trainable=True)
 
-        if not self.tp.distributed and self.tp.framework == Frameworks.TensorFlow:
-            variables_to_restore = tf.global_variables()
-            variables_to_restore = [v for v in variables_to_restore if '/online' in v.name]
-            self.model_saver = tf.train.Saver(variables_to_restore)
-            #, max_to_keep=None) # uncomment to unlimit number of stored checkpoints
-            if self.tp.sess and self.tp.checkpoint_restore_dir:
-                checkpoint = tf.train.latest_checkpoint(self.tp.checkpoint_restore_dir)
-                screen.log_title("Loading checkpoint: {}".format(checkpoint))
-                self.model_saver.restore(self.tp.sess, checkpoint)
-                self.update_target_network()
+            # Target network - a local, slow updating network used for stabilizing the learning
+            self.target_network = None
+            if self.has_target:
+                with tf.device(worker_device):
+                    self.target_network = general_network(agent_parameters=agent_parameters,
+                                                          name='{}/target'.format(name),
+                                                          global_network=self.global_network,
+                                                          network_is_local=True,
+                                                          spaces=spaces,
+                                                          network_is_trainable=False)
+
+            if not isinstance(self.ap.task_parameters, DistributedTaskParameters) and \
+                            self.network_parameters.framework == Frameworks.TensorFlow:
+                self.model_saver = tf.train.Saver(tf.global_variables())
 
     def sync(self):
         """
@@ -126,15 +132,18 @@ class NetworkWrapper(object):
         """
         self.online_network.apply_gradients(self.online_network.accumulated_gradients)
 
-    def train_and_sync_networks(self, inputs, targets, additional_fetches=[]):
+    def train_and_sync_networks(self, inputs, targets, additional_fetches=[], importance_weights=None):
         """
         A generic training function that enables multi-threading training using a global network if necessary.
         :param inputs: The inputs for the network.
         :param targets: The targets corresponding to the given inputs
         :param additional_fetches: Any additional tensor the user wants to fetch
+        :param importance_weights: A coefficient for each sample in the batch, which will be used to rescale the loss
+                                   error of this sample. If it is not given, the samples losses won't be scaled
         :return: The loss of the training iteration
         """
-        result = self.online_network.accumulate_gradients(inputs, targets, additional_fetches=additional_fetches)
+        result = self.online_network.accumulate_gradients(inputs, targets, additional_fetches=additional_fetches,
+                                                          importance_weights=importance_weights)
         self.apply_gradients_and_sync_networks()
         return result
 
@@ -155,9 +164,9 @@ class NetworkWrapper(object):
         Get all the variables that are local to the thread
         :return: a list of all the variables that are local to the thread
         """
-        local_variables = [v for v in tf.global_variables() if self.online_network.name in v.name]
+        local_variables = [v for v in tf.local_variables() if self.online_network.name in v.name]
         if self.has_target:
-            local_variables += [v for v in tf.global_variables() if self.target_network.name in v.name]
+            local_variables += [v for v in tf.local_variables() if self.target_network.name in v.name]
         return local_variables
 
     def get_global_variables(self):
@@ -170,15 +179,23 @@ class NetworkWrapper(object):
 
     def set_session(self, sess):
         self.sess = sess
-        self.online_network.sess = sess
+        self.online_network.set_session(sess)
         if self.global_network:
-            self.global_network.sess = sess
+            self.global_network.set_session(sess)
         if self.target_network:
-            self.target_network.sess = sess
+            self.target_network.set_session(sess)
+
+        if self.sess and hasattr(self.ap.task_parameters, 'checkpoint_restore_dir') \
+                and self.ap.task_parameters.checkpoint_restore_dir:
+            checkpoint = tf.train.latest_checkpoint(self.ap.task_parameters.checkpoint_restore_dir)
+            screen.log_title("Loading checkpoint: {}".format(checkpoint))
+            self.model_saver.restore(self.sess, checkpoint)
+            self.update_target_network()
 
     def save_model(self, model_id):
-        saved_model_path = self.model_saver.save(self.tp.sess, os.path.join(self.tp.save_model_dir,
-                                                                        str(model_id) + '.ckpt'))
+        saved_model_path = self.model_saver.save(self.sess,
+                                                 os.path.join(self.network_parameters.save_model_dir,
+                                                              str(model_id) + '.ckpt'))
         screen.log_dict(
             OrderedDict([
                 ("Saving model", saved_model_path),
