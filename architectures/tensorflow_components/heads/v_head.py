@@ -15,16 +15,22 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
-from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head, normalized_columns_initializer
+
+from architectures.tensorflow_components.heads.head import Head, normalized_columns_initializer, HeadParameters
+from base_parameters import AgentParameters
 from core_types import VStateValue
+from spaces import SpacesDefinition
+
+
+class VHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='v_head_params'):
+        super().__init__(parameterized_class=VHead, activation_function=activation_function, name=name)
 
 
 class VHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'v_values_head'
         self.return_type = VStateValue
 

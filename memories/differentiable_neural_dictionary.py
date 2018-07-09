@@ -14,9 +14,11 @@
 # limitations under the License.
 #
 
+import os
+import pickle
+
 import numpy as np
 from annoy import AnnoyIndex
-import os, pickle
 
 
 class AnnoyDictionary(object):

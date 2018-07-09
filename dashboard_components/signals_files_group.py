@@ -47,9 +47,15 @@ class SignalsFilesGroup(SignalsFileBase):
         results = Manager().dict()
         corrupted_files_idx = []
         for idx, signal_file in enumerate(self.signals_files):
-            processes.append(Process(target=signal_file.load_csv, args=(idx, results)))
-            processes[-1].start()
+            if not isinstance(signal_file, SignalsFilesGroup):
+                processes.append(Process(target=signal_file.load_csv, args=(idx, results)))
+                processes[-1].start()
         [p.join() for p in processes]
+
+        # load csv's for SignalsFilesGroup serially for now. TODO: we should later parallelize this as well.
+        for idx, signal_file in enumerate(self.signals_files):
+            if isinstance(signal_file, SignalsFilesGroup):
+                signal_file.load_csv()
 
         for idx, signal_file in enumerate(self.signals_files):
             signal_file.csv, signal_file.last_modified = results[idx]
@@ -81,9 +87,9 @@ class SignalsFilesGroup(SignalsFileBase):
                 transformed_signals_files[-1] = transformed_signals_files[-1].reindex(range(num_rows))
                 transformed_signals_files[-1].interpolate(inplace=True)
 
-                # sub sample the csv to max of 10000 indices (do the same subsampling to all files)
+                # sub sample the csv to max of 5000 indices (do the same subsampling to all files)
                 if subsampling is None:
-                    subsampling = max(1, num_rows // 10000)
+                    subsampling = max(1, num_rows // 5000)
                 transformed_signals_files[-1] = transformed_signals_files[-1].iloc[::subsampling, :]
 
             csv_group = pd.concat([signals_file for signals_file in transformed_signals_files])

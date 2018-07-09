@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+from collections import OrderedDict
 from typing import Union
 
 from agents.agent import Agent
 from core_types import RunPhase, ActionInfo
 from logger import screen
-from collections import OrderedDict
-from spaces import Discrete
+from spaces import DiscreteActionSpace
 
+
+## This is an abstract agent - there is no learn_from_batch method ##
 
 # Imitation Agent
 class ImitationAgent(Agent):
@@ -34,11 +37,11 @@ class ImitationAgent(Agent):
 
     def choose_action(self, curr_state):
         # convert to batch so we can run it through the network
-        prediction = self.networks['main'].online_network.predict(self.dict_state_to_batches_dict(curr_state, 'main'))
+        prediction = self.networks['main'].online_network.predict(self.prepare_batch_for_inference(curr_state, 'main'))
 
         # get action values and extract the best action from it
         action_values = self.extract_action_values(prediction)
-        if type(self.spaces.action) == Discrete:
+        if type(self.spaces.action) == DiscreteActionSpace:
             # DISCRETE
             # TODO: refactor
             self.exploration_policy.phase = RunPhase.TEST
@@ -68,3 +71,6 @@ class ImitationAgent(Agent):
         else:
             # for the evaluation phase - logging as in regular RL
             super().log_to_screen()
+
+    def learn_from_batch(self, batch):
+        raise NotImplementedError("ImitationAgent is an abstract agent. Not to be used directly.")

@@ -22,9 +22,6 @@ class SingleEpisodeBufferParameters(MemoryParameters):
     def __init__(self):
         super().__init__()
         del self.max_size
-        self.discount = 0.99
-        self.bootstrap_total_return_from_old_policy = False
-        self.n_step = -1
 
     @property
     def path(self):
@@ -32,13 +29,5 @@ class SingleEpisodeBufferParameters(MemoryParameters):
 
 
 class SingleEpisodeBuffer(EpisodicExperienceReplay):
-    def __init__(self,  discount: float,
-                 bootstrap_total_return_from_old_policy: bool, n_step: int):
-        """
-        :param discount: the discount factor to use when calculating total returns
-        :param bootstrap_total_return_from_old_policy: should the total return be bootstrapped from the values in the
-                                                       memory
-        :param n_step: the number of future steps to sum the reward over before bootstrapping
-
-        """
-        super().__init__((MemoryGranularity.Episodes, 1), discount, bootstrap_total_return_from_old_policy, n_step, 0)
+    def __init__(self):
+        super().__init__((MemoryGranularity.Episodes, 1))

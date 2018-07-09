@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import multiprocessing
-from multiprocessing import Manager
-import numpy as np
+
+import os
+import pickle
 import time
+from multiprocessing import Manager
+
+import numpy as np
 from annoy import AnnoyIndex
-import os, pickle
 
 
 class AnnoyDictionary(object):
@@ -135,6 +137,7 @@ class AnnoyDictionary(object):
             # this will only happen when the DND is not yet populated with enough entries, which is only during heatup
             # these values won't be used and therefore they are meaningless
             self.num_readers -= 1
+            # TODO: shouldn't we release writing as well?
             return [0.0], [0.0], [0]
 
         _, indices = self._get_k_nearest_neighbors_indices(keys, k)

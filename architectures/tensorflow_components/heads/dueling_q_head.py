@@ -15,27 +15,34 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
-from spaces import SpacesDefinition
+
+from architectures.tensorflow_components.heads.head import HeadParameters
 from architectures.tensorflow_components.heads.q_head import QHead
+from base_parameters import AgentParameters
+from spaces import SpacesDefinition
+
+
+class DuelingQHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='dueling_q_head_params'):
+        super().__init__(parameterized_class=DuelingQHead, activation_function=activation_function, name=name)
 
 
 class DuelingQHead(QHead):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'dueling_q_values_head'
 
     def _build_module(self, input_layer):
         # state value tower - V
         with tf.variable_scope("state_value"):
-            state_value = tf.layers.dense(input_layer, 256, activation=tf.nn.relu, name='fc1')
+            state_value = tf.layers.dense(input_layer, 512, activation=self.activation_function, name='fc1')
             state_value = tf.layers.dense(state_value, 1, name='fc2')
             # state_value = tf.expand_dims(state_value, axis=-1)
 
         # action advantage tower - A
         with tf.variable_scope("action_advantage"):
-            action_advantage = tf.layers.dense(input_layer, 256, activation=tf.nn.relu, name='fc1')
+            action_advantage = tf.layers.dense(input_layer, 512, activation=self.activation_function, name='fc1')
             action_advantage = tf.layers.dense(action_advantage, self.num_actions, name='fc2')
             action_advantage = action_advantage - tf.reduce_mean(action_advantage)
 

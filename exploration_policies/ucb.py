@@ -14,12 +14,16 @@
 # limitations under the License.
 #
 
-from exploration_policies.e_greedy import EGreedy, EGreedyParameters
-from schedules import Schedule, LinearSchedule, PieceWiseLinearSchedule
-from spaces import ActionSpace
-import numpy as np
-from core_types import RunPhase, ActionType
 from typing import List
+
+import numpy as np
+
+from core_types import RunPhase, ActionType, EnvironmentSteps
+from exploration_policies.additive_noise import AdditiveNoiseParameters
+from exploration_policies.e_greedy import EGreedy, EGreedyParameters
+from exploration_policies.exploration_policy import ExplorationParameters
+from schedules import Schedule, LinearSchedule, PieceWiseSchedule
+from spaces import ActionSpace
 
 
 class UCBParameters(EGreedyParameters):
@@ -27,9 +31,9 @@ class UCBParameters(EGreedyParameters):
         super().__init__()
         self.architecture_num_q_heads = 10
         self.bootstrapped_data_sharing_probability = 1.0
-        self.epsilon_schedule = PieceWiseLinearSchedule([
-            LinearSchedule(1, 0.1, 1000000),
-            LinearSchedule(0.1, 0.01, 4000000)
+        self.epsilon_schedule = PieceWiseSchedule([
+            (LinearSchedule(1, 0.1, 1000000), EnvironmentSteps(1000000)),
+            (LinearSchedule(0.1, 0.01, 4000000), EnvironmentSteps(4000000))
         ])
         self.lamb = 0.1
 
@@ -40,16 +44,18 @@ class UCBParameters(EGreedyParameters):
 
 class UCB(EGreedy):
     def __init__(self, action_space: ActionSpace, epsilon_schedule: Schedule, evaluation_epsilon: float,
-                 noise_percentage_schedule: Schedule, architecture_num_q_heads: int, lamb: int):
+                 architecture_num_q_heads: int, lamb: int,
+                 continuous_exploration_policy_parameters: ExplorationParameters = AdditiveNoiseParameters()):
         """
         :param action_space: the action space used by the environment
         :param epsilon_schedule: a schedule for the epsilon values
         :param evaluation_epsilon: the epsilon value to use for evaluation phases
-        :param noise_percentage_schedule: a schedule for the noise percentage values
         :param architecture_num_q_heads: the number of q heads to select from
         :param lamb: lambda coefficient for taking the standard deviation into account
+        :param continuous_exploration_policy_parameters: the parameters of the continuous exploration policy to use
+                                                         if the e-greedy is used for a continuous policy
         """
-        super().__init__(action_space, epsilon_schedule, evaluation_epsilon, noise_percentage_schedule)
+        super().__init__(action_space, epsilon_schedule, evaluation_epsilon, continuous_exploration_policy_parameters)
         self.num_heads = architecture_num_q_heads
         self.lamb = lamb
         self.std = 0
@@ -59,12 +65,13 @@ class UCB(EGreedy):
         pass
 
     def get_action(self, action_values: List[ActionType]) -> ActionType:
-        mean = np.mean(action_values, axis=0)
-        if self.phase == RunPhase.TRAIN:
-            self.std = np.std(action_values, axis=0)
-            self.last_action_values = mean + self.lamb * self.std
-        else:
-            self.last_action_values = mean
+        if self.requires_action_values():
+            mean = np.mean(action_values, axis=0)
+            if self.phase == RunPhase.TRAIN:
+                self.std = np.std(action_values, axis=0)
+                self.last_action_values = mean + self.lamb * self.std
+            else:
+                self.last_action_values = mean
         return super().get_action(self.last_action_values)
 
     def get_control_param(self):

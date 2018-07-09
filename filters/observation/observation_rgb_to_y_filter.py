@@ -14,9 +14,9 @@
 # limitations under the License.
 #
 
+from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace
-from core_types import ObservationType
 
 
 class ObservationRGBToYFilter(ObservationFilter):
@@ -36,7 +36,7 @@ class ObservationRGBToYFilter(ObservationFilter):
             raise ValueError("The observation space is expected to have 3 channels in the 1st dimension. The number of "
                              "dimensions received is {}".format(input_observation_space.shape[-1]))
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
 
         # rgb to y
         r, g, b = observation[:, :, 0], observation[:, :, 1], observation[:, :, 2]

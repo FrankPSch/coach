@@ -14,12 +14,14 @@
 # limitations under the License.
 #
 
+from typing import List
+
+import numpy as np
+
+from core_types import RunPhase, ActionType
 from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
 from schedules import Schedule
 from spaces import ActionSpace
-import numpy as np
-from core_types import RunPhase, ActionType
-from typing import List
 
 
 class BoltzmannParameters(ExplorationParameters):

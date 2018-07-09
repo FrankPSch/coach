@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+import operator
 import random
+from enum import Enum
+from typing import List, Tuple, Any
 
 import numpy as np
 
-from memories.memory import Memory, Episode, MemoryGranularity, MemoryParameters
-from memories.experience_replay import ExperienceReplayParameters, ExperienceReplay
 from core_types import Transition
-from typing import List, Tuple, Union, Dict, Any
-from enum import Enum
-import operator
-import sys
+from memories.experience_replay import ExperienceReplayParameters, ExperienceReplay
+from memories.memory import MemoryGranularity
 from schedules import Schedule, ConstantSchedule
 
 
@@ -48,11 +48,11 @@ class SegmentTree(object):
     """
     class Operation(Enum):
         MAX = {"operator": max, "initial_value": -float("inf")}
-        MIN = {"operator": min, "initial_value": 1000}
+        MIN = {"operator": min, "initial_value": float("inf")}
         SUM = {"operator": operator.add, "initial_value": 0}
 
     def __init__(self, size: int, operation: Operation):
-        self.next_idx_to_write = 0
+        self.next_leaf_idx_to_write = 0
         self.size = size
         if not (size > 0 and size & (size - 1) == 0):
             raise ValueError("A segment tree size must be a positive power of 2. The given size is {}".format(self.size))
@@ -60,32 +60,31 @@ class SegmentTree(object):
         self.tree = np.ones(2 * size - 1) * self.operation.value['initial_value']
         self.data = [None] * size
 
-    def _propagate(self, idx: int, change: float) -> None:
+    def _propagate(self, node_idx: int) -> None:
         """
         Propagate an update of a node's value to its parent node
-        :param idx: the index of the node that was updated
-        :param change: the change in the value of the node
+        :param node_idx: the index of the node that was updated
         :return: None
         """
-        parent = (idx - 1) // 2
+        parent = (node_idx - 1) // 2
 
-        self.tree[parent] = self.operation.value['operator'](self.tree[parent], change)
+        self.tree[parent] = self.operation.value['operator'](self.tree[parent * 2 + 1], self.tree[parent * 2 + 2])
 
         if parent != 0:
-            self._propagate(parent, change)
+            self._propagate(parent)
 
-    def _retrieve(self, idx: int, val: float)-> int:
+    def _retrieve(self, root_node_idx: int, val: float)-> int:
         """
         Retrieve the first node that has a value larger than val and is a child of the node at index idx
-        :param idx: the index of the root node to search from
+        :param root_node_idx: the index of the root node to search from
         :param val: the value to query for
         :return: the index of the resulting node
         """
-        left = 2 * idx + 1
+        left = 2 * root_node_idx + 1
         right = left + 1
 
         if left >= len(self.tree):
-            return idx
+            return root_node_idx
 
         if val <= self.tree[left]:
             return self._retrieve(left, val)
@@ -95,7 +94,7 @@ class SegmentTree(object):
     def total_value(self) -> float:
         """
         Return the total value of the tree according to the tree operation. For SUM for example, this will return
-        the total sum of the tree
+        the total sum of the tree. for MIN, this will return the minimal value
         :return: the total value of the tree
         """
         return self.tree[0]
@@ -107,31 +106,27 @@ class SegmentTree(object):
         :param data: the data that should be assigned to this value
         :return: None
         """
-        idx = self.next_idx_to_write + self.size - 1
+        self.data[self.next_leaf_idx_to_write] = data
+        self.update(self.next_leaf_idx_to_write, val)
 
-        self.data[self.next_idx_to_write] = data
-        self.update(idx, val)
+        self.next_leaf_idx_to_write += 1
+        if self.next_leaf_idx_to_write >= self.size:
+            self.next_leaf_idx_to_write = 0
 
-        self.next_idx_to_write += 1
-        if self.next_idx_to_write >= self.size:
-            self.next_idx_to_write = 0
-
-    def update(self, idx: int, new_val: float) -> None:
+    def update(self, leaf_idx: int, new_val: float) -> None:
         """
         Update the value of the node at index idx
-        :param idx: the index of the node to update
+        :param leaf_idx: the index of the node to update
         :param new_val: the new value of the node
         :return: None
         """
-        if not 0 <= idx < len(self.tree):
-            raise ValueError("The given index can not be found in the tree")
+        node_idx = leaf_idx + self.size - 1
+        if not 0 <= node_idx < len(self.tree):
+            raise ValueError("The given left index ({}) can not be found in the tree. The available leaves are: 0-{}"
+                             .format(leaf_idx, self.size - 1))
 
-        change = new_val
-        if self.operation == SegmentTree.Operation.SUM:
-            change -= self.tree[idx]
-
-        self.tree[idx] = new_val
-        self._propagate(idx, change)
+        self.tree[node_idx] = new_val
+        self._propagate(node_idx)
 
     def get(self, val: float) -> Tuple[int, float, Any]:
         """
@@ -140,15 +135,15 @@ class SegmentTree(object):
         leaves by their order until getting to 35. This allows sampling leaves according to their proportional
         probability.
         :param val: a value within the range 0 and the tree sum
-        :return: the index of the resulting node in the tree relative to the root node, it's probability and
+        :return: the index of the resulting leaf in the tree, it's probability and
                  the object itself
         """
-        idx = self._retrieve(0, val)
-        data_idx = idx - self.size + 1
-        data_value = self.tree[idx]
-        data = self.data[data_idx]
+        node_idx = self._retrieve(0, val)
+        leaf_idx = node_idx - self.size + 1
+        data_value = self.tree[node_idx]
+        data = self.data[leaf_idx]
 
-        return idx, data_value, data
+        return leaf_idx, data_value, data
 
     def __str__(self):
         result = ""
@@ -167,37 +162,43 @@ class PrioritizedExperienceReplay(ExperienceReplay):
     in https://arxiv.org/pdf/1511.05952.pdf.
     """
     def __init__(self, max_size: Tuple[MemoryGranularity, int], alpha: float=0.6, beta: Schedule=ConstantSchedule(0.4),
-                 epsilon: float=1e-6):
+                 epsilon: float=1e-6, allow_duplicates_in_batch_sampling: bool=True):
         """
         :param max_size: the maximum number of transitions or episodes to hold in the memory
         :param alpha: the alpha prioritization coefficient
         :param beta: the beta parameter used for importance sampling
         :param epsilon: a small value added to the priority of each transition
+        :param allow_duplicates_in_batch_sampling: allow having the same transition multiple times in a batch
         """
+        if max_size[0] != MemoryGranularity.Transitions:
+            raise ValueError("Prioritized Experience Replay currently only support setting the memory size in "
+                             "transitions granularity.")
         self.power_of_2_size = 1
         while self.power_of_2_size < max_size[1]:
             self.power_of_2_size *= 2
-        super().__init__((MemoryGranularity.Transitions, self.power_of_2_size))
+        super().__init__((MemoryGranularity.Transitions, self.power_of_2_size), allow_duplicates_in_batch_sampling)
         self.sum_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.SUM)
         self.min_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.MIN)
+        self.max_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.MAX)
         self.alpha = alpha
         self.beta = beta
         self.epsilon = epsilon
         self.maximal_priority = 1.0
 
-    def update_priority(self, node_idx: int, error: float) -> None:
+    def _update_priority(self, leaf_idx: int, error: float) -> None:
         """
         Update the priority of a given transition, using its index in the tree and its error
-        :param node_idx: the index of the transition leaf in the tree
+        :param leaf_idx: the index of the transition leaf in the tree
         :param error: the new error value
         :return: None
         """
-        if error <= 0:
-            raise ValueError("The priorities must be positive values")
-        priority = (error + self.epsilon) ** self.alpha
-        self.sum_tree.update(node_idx, priority)
-        self.min_tree.update(node_idx, priority)
-        self.maximal_priority = max(self.maximal_priority, priority)
+        if error < 0:
+            raise ValueError("The priorities must be non-negative values")
+        priority = (error + self.epsilon)
+        self.sum_tree.update(leaf_idx, priority ** self.alpha)
+        self.min_tree.update(leaf_idx, priority ** self.alpha)
+        self.max_tree.update(leaf_idx, priority)
+        self.maximal_priority = self.max_tree.total_value()
 
     def update_priorities(self, indices: List[int], error_values: List[float]) -> None:
         """
@@ -206,28 +207,33 @@ class PrioritizedExperienceReplay(ExperienceReplay):
         :param error_values: the new error values
         :return: None
         """
+        self.reader_writer_lock.lock_writing_and_reading()
+
         if len(indices) != len(error_values):
             raise ValueError("The number of indexes requested for update don't match the number of error values given")
         for transition_idx, error in zip(indices, error_values):
-            node_idx = transition_idx + self.power_of_2_size - 1  # convert to tree node index
-            self.update_priority(node_idx, error)
+            self._update_priority(transition_idx, error)
+
+        self.reader_writer_lock.release_writing_and_reading()
 
     def sample(self, size: int) -> List[Transition]:
         """
         Sample a batch of transitions form the replay buffer. If the requested size is larger than the number
         of samples available in the replay buffer then the batch will return empty.
         :param size: the size of the batch to sample
-        :param beta: the beta parameter used for importance sampling
         :return: a batch (list) of selected transitions from the replay buffer
         """
+
+        self.reader_writer_lock.lock_writing()
+
         if self.num_transitions() >= size:
             # split the tree leaves to equal segments and sample one transition from each segment
             batch = []
             segment_size = self.sum_tree.total_value() / size
 
             # get the maximum weight in the memory
-            min_probability = self.min_tree.total_value() / self.sum_tree.total_value()
-            max_weight = (min_probability * self.num_transitions()) ** -self.beta.current_value
+            min_probability = self.min_tree.total_value() / self.sum_tree.total_value()  # min P(j) = min p^a / sum(p^a)
+            max_weight = (min_probability * self.num_transitions()) ** -self.beta.current_value  # max wi
 
             # sample a batch
             for i in range(size):
@@ -236,21 +242,24 @@ class PrioritizedExperienceReplay(ExperienceReplay):
 
                 # sample leaf and calculate its weight
                 val = random.uniform(start_probability, end_probability)
-                node_idx, priority, transition = self.sum_tree.get(val)
-                priority /= self.sum_tree.total_value()
-                weight = ((priority * self.num_transitions()) ** -self.beta.current_value) / max_weight
+                leaf_idx, priority, transition = self.sum_tree.get(val)
+                priority /= self.sum_tree.total_value()   # P(j) = p^a / sum(p^a)
+                weight = (self.num_transitions() * priority) ** -self.beta.current_value  # (N * P(j)) ^ -beta
+                normalized_weight = weight / max_weight  # wj = ((N * P(j)) ^ -beta) / max wi
 
-                transition.info['idx'] = node_idx - self.power_of_2_size + 1
-                transition.info['weight'] = weight
+                transition.info['idx'] = leaf_idx
+                transition.info['weight'] = normalized_weight
 
                 batch.append(transition)
 
             self.beta.step()
 
-            return batch
         else:
             raise ValueError("The replay buffer cannot be sampled since there are not enough transitions yet. "
                              "There are currently {} transitions".format(self.num_transitions()))
+
+        self.reader_writer_lock.release_writing()
+        return batch
 
     def store(self, transition: Transition) -> None:
         """
@@ -258,16 +267,26 @@ class PrioritizedExperienceReplay(ExperienceReplay):
         :param transition: a transition to store
         :return: None
         """
+        self.reader_writer_lock.lock_writing_and_reading()
+
         transition_priority = self.maximal_priority
-        self.sum_tree.add(transition_priority, transition)
-        self.min_tree.add(transition_priority, transition)
-        super().store(transition)
+        self.sum_tree.add(transition_priority ** self.alpha, transition)
+        self.min_tree.add(transition_priority ** self.alpha, transition)
+        self.max_tree.add(transition_priority, transition)
+        super().store(transition, False)
+
+        self.reader_writer_lock.release_writing_and_reading()
 
     def clean(self) -> None:
         """
         Clean the memory by removing all the episodes
         :return: None
         """
-        super().clean()
+        self.reader_writer_lock.lock_writing_and_reading()
+
+        super().clean(lock=False)
         self.sum_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.SUM)
         self.min_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.MIN)
+        self.max_tree = SegmentTree(self.power_of_2_size, SegmentTree.Operation.MAX)
+
+        self.reader_writer_lock.release_writing_and_reading()

@@ -14,10 +14,11 @@
 # limitations under the License.
 #
 
+import numpy as np
+
+from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace
-from core_types import ObservationType
-import numpy as np
 
 
 class ObservationSqueezeFilter(ObservationFilter):
@@ -36,7 +37,7 @@ class ObservationSqueezeFilter(ObservationFilter):
         if self.axis >= len(shape) or self.axis < -len(shape):
             raise ValueError("The given axis does not exist in the context of the input observation shape. ")
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
         return observation.squeeze(axis=self.axis)
 
     def get_filtered_observation_space(self, input_observation_space: ObservationSpace) -> ObservationSpace:

@@ -15,13 +15,14 @@
 #
 
 from typing import Union, Dict
+
 from core_types import ActionType, EnvResponse, RunPhase
 from spaces import ActionSpace
 
 
 class EnvironmentInterface(object):
     def __init__(self):
-        self._phase = RunPhase.HEATUP
+        self._phase = RunPhase.UNDEFINED
 
     @property
     def phase(self) -> RunPhase:
@@ -64,7 +65,7 @@ class EnvironmentInterface(object):
         """
         raise NotImplementedError("")
 
-    def reset(self, force_environment_reset: bool=False) -> Union[None, EnvResponse]:
+    def reset_internal_state(self, force_environment_reset: bool=False) -> Union[None, EnvResponse]:
         """
         Reset the environment episode
         :param force_environment_reset: in some cases, resetting the environment can be suppressed by the environment

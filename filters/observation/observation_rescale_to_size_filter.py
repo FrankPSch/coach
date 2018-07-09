@@ -14,13 +14,15 @@
 # limitations under the License.
 #
 
+import copy
+from enum import Enum
+
+import numpy as np
+import scipy.ndimage
+
+from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace, PlanarMapsObservationSpace, ImageObservationSpace
-from core_types import ObservationType
-import scipy.ndimage
-from enum import Enum
-import copy
-import numpy as np
 
 
 # imresize interpolation types as defined by scipy here:
@@ -71,7 +73,7 @@ class ObservationRescaleToSizeFilter(ObservationFilter):
                              .format(input_observation_space.shape[input_observation_space.channels_axis],
                              self.output_observation_space.shape[self.output_observation_space.channels_axis]))
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
         # scipy works only with uint8
         observation = observation.astype('uint8')
 

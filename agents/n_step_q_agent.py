@@ -13,39 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
-from agents.policy_optimization_agent import PolicyOptimizationAgent
-from utils import Signal, last_sample
 import numpy as np
-from configurations import AlgorithmParameters, AgentParameters, InputTypes, OutputTypes, MiddlewareTypes, \
-    NetworkParameters, InputEmbedderParameters
+
+from agents.policy_optimization_agent import PolicyOptimizationAgent
+from agents.value_optimization_agent import ValueOptimizationAgent
+from architectures.tensorflow_components.heads.q_head import QHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AlgorithmParameters, AgentParameters, NetworkParameters, \
+    InputEmbedderParameters
+from core_types import EnvironmentSteps, TrainingSteps
 from exploration_policies.e_greedy import EGreedyParameters
 from memories.single_episode_buffer import SingleEpisodeBufferParameters
+from utils import last_sample
 
 
 class NStepQNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.Q]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.middleware_parameters = FCMiddlewareParameters()
+        self.heads_parameters = [QHeadParameters()]
         self.loss_weights = [1.0]
         self.optimizer_type = 'Adam'
         self.async_training = True
         self.shared_optimizer = True
-        self.hidden_layers_activation_function = 'elu'
         self.create_target_network = True
 
 
 class NStepQAlgorithmParameters(AlgorithmParameters):
     def __init__(self):
         super().__init__()
-        self.num_steps_between_copying_online_weights_to_target = 1000
-        self.num_episodes_in_experience_replay = 2
+        self.num_steps_between_copying_online_weights_to_target = EnvironmentSteps(10000)
         self.apply_gradients_every_x_episodes = 1
-        self.num_steps_between_gradient_updates = 20  # this is called t_max in all the papers
+        self.num_steps_between_gradient_updates = 5  # this is called t_max in all the papers
         self.targets_horizon = 'N-Step'
 
 
@@ -71,38 +74,37 @@ class NStepQAgent(ValueOptimizationAgent, PolicyOptimizationAgent):
 
     def learn_from_batch(self, batch):
         # batch contains a list of episodes to learn from
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # get the values for the current states
-        state_value_head_targets = self.networks['main'].online_network.predict(current_states)
+        state_value_head_targets = self.networks['main'].online_network.predict(batch.states(network_keys))
 
         # the targets for the state value estimator
-        num_transitions = len(game_overs)
-
         if self.ap.algorithm.targets_horizon == '1-Step':
             # 1-Step Q learning
-            q_st_plus_1 = self.networks['main'].target_network.predict(next_states)
+            q_st_plus_1 = self.networks['main'].target_network.predict(batch.next_states(network_keys))
 
-            for i in reversed(range(num_transitions)):
-                state_value_head_targets[i][actions[i]] = \
-                    rewards[i] + (1.0 - game_overs[i]) * self.ap.algorithm.discount * np.max(q_st_plus_1[i], 0)
+            for i in reversed(range(batch.size)):
+                state_value_head_targets[i][batch.actions()[i]] = \
+                    batch.rewards()[i] \
+                    + (1.0 - batch.game_overs()[i]) * self.ap.algorithm.discount * np.max(q_st_plus_1[i], 0)
 
         elif self.ap.algorithm.targets_horizon == 'N-Step':
             # N-Step Q learning
-            if game_overs[-1]:
+            if batch.game_overs()[-1]:
                 R = 0
             else:
-                R = np.max(self.networks['main'].target_network.predict(last_sample(next_states)))
+                R = np.max(self.networks['main'].target_network.predict(last_sample(batch.next_states(network_keys))))
 
-            for i in reversed(range(num_transitions)):
-                R = rewards[i] + self.ap.algorithm.discount * R
-                state_value_head_targets[i][actions[i]] = R
+            for i in reversed(range(batch.size)):
+                R = batch.rewards()[i] + self.ap.algorithm.discount * R
+                state_value_head_targets[i][batch.actions()[i]] = R
 
         else:
             assert True, 'The available values for targets_horizon are: 1-Step, N-Step'
 
         # train
-        result = self.networks['main'].online_network.accumulate_gradients(current_states, [state_value_head_targets])
+        result = self.networks['main'].online_network.accumulate_gradients(batch.states(network_keys), [state_value_head_targets])
 
         # logging
         total_loss, losses, unclipped_grads = result[:3]
@@ -112,9 +114,11 @@ class NStepQAgent(ValueOptimizationAgent, PolicyOptimizationAgent):
 
     def train(self):
         # update the target network of every network that has a target network
-        if self.total_steps_counter % self.ap.algorithm.num_steps_between_copying_online_weights_to_target == 0:
+        if any([network.has_target for network in self.networks.values()]) \
+                and self._should_update_online_weights_to_target():
             for network in self.networks.values():
                 network.update_target_network(self.ap.algorithm.rate_for_copying_weights_to_target)
+
             self.agent_logger.create_signal_value('Update Target Network', 1)
         else:
             self.agent_logger.create_signal_value('Update Target Network', 0, overwrite=False)

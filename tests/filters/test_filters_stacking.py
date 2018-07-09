@@ -61,8 +61,8 @@ def test_filter_stacking():
         ])
     )
 
-    result = input_filter.filter(env_response)
-    observation = np.array(result.new_state['observation'])
+    result = input_filter.filter(env_response)[0]
+    observation = np.array(result.next_state['observation'])
     assert observation.shape == (84, 84, 4)
     assert np.all(observation == np.ones([84, 84, 4]))
     assert result.reward == 1

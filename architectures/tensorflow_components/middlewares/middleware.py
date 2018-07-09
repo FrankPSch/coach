@@ -13,25 +13,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
+from typing import Type, Union, List
 
 import tensorflow as tf
 
-from core_types import Embedding, MiddlewareEmbedding
+from base_parameters import MiddlewareScheme, Parameters
+from core_types import MiddlewareEmbedding
 
 
-class MiddlewareEmbedder(object):
+class MiddlewareParameters(Parameters):
+    def __init__(self, parameterized_class: Type['Middleware'],
+                 activation_function: str='relu', scheme: Union[List, MiddlewareScheme]=MiddlewareScheme.Medium,
+                 batchnorm: bool=False, dropout: bool=False,
+                 name='middleware'):
+        super().__init__()
+        self.activation_function = activation_function
+        self.scheme = scheme
+        self.batchnorm = batchnorm
+        self.dropout = dropout
+        self.name = name
+        self.parameterized_class_name = parameterized_class.__name__
+
+
+class Middleware(object):
     """
     A middleware embedder is the middle part of the network. It takes the embeddings from the input embedders,
     after they were aggregated in some method (for example, concatenation) and passes it through a neural network
     which can be customizable but shared between the heads of the network
     """
-    def __init__(self, activation_function=tf.nn.relu, size=512, name="middleware_embedder"):
+    def __init__(self, activation_function=tf.nn.relu,
+                 scheme: MiddlewareScheme = MiddlewareScheme.Medium,
+                 batchnorm: bool = False, dropout: bool = False, name="middleware_embedder"):
         self.name = name
         self.input = None
         self.output = None
         self.activation_function = activation_function
-        self.size = size
+        self.batchnorm = batchnorm
+        self.dropout = dropout
+        self.dropout_rate = 0
+        self.scheme = scheme
         self.return_type = MiddlewareEmbedding
 
     def __call__(self, input_layer):

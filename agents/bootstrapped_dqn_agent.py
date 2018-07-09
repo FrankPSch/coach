@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
 import numpy as np
+
 from agents.dqn_agent import DQNAgentParameters, DQNNetworkParameters
+from agents.value_optimization_agent import ValueOptimizationAgent
 from exploration_policies.bootstrapped import BootstrappedParameters
 
 
@@ -44,16 +46,18 @@ class BootstrappedDQNAgent(ValueOptimizationAgent):
     def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
         super().__init__(agent_parameters, parent)
 
-    def reset(self):
-        super().reset()
+    def reset_internal_state(self):
+        super().reset_internal_state()
         self.exploration_policy.select_head()
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
-        next_states_online_values = self.networks['main'].online_network.predict(next_states)
-        q_st_plus_1 = self.networks['main'].target_network.predict(next_states)
-        TD_targets = self.networks['main'].online_network.predict(current_states)
+        next_states_online_values = self.networks['main'].online_network.predict(batch.next_states(network_keys))
+        q_st_plus_1, TD_targets = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.next_states(network_keys)),
+            (self.networks['main'].online_network, batch.states(network_keys))
+        ])
 
         # initialize with the current prediction so that we will
         #  only update the action that we have actually done in this transition
@@ -62,11 +66,11 @@ class BootstrappedDQNAgent(ValueOptimizationAgent):
             for head_idx in range(self.ap.exploration.architecture_num_q_heads):
                 if mask[head_idx] == 1:
                     selected_action = np.argmax(next_states_online_values[head_idx][i], 0)
-                    TD_targets[head_idx][i, actions[i]] = \
-                        rewards[i] + (1.0 - game_overs[i]) * self.ap.algorithm.discount \
+                    TD_targets[head_idx][i, batch.actions()[i]] = \
+                        batch.rewards()[i] + (1.0 - batch.game_overs()[i]) * self.ap.algorithm.discount \
                                      * q_st_plus_1[head_idx][i][selected_action]
 
-        result = self.networks['main'].train_and_sync_networks(current_states, TD_targets)
+        result = self.networks['main'].train_and_sync_networks(batch.states(network_keys), TD_targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads

@@ -14,10 +14,12 @@
 # limitations under the License.
 #
 
+import math
+
 import matplotlib.pyplot as plt
 import numpy as np
+
 from filters.observation.observation_stacking_filter import LazyStack
-import math
 
 
 def show_observation_stack(stack, channels_last=True, show=True, force_num_rows=None, row_to_update=0):

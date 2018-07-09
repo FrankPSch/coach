@@ -14,10 +14,11 @@
 # limitations under the License.
 #
 
+import numpy as np
+
+from core_types import RewardType
 from filters.reward.reward_filter import RewardFilter
 from spaces import RewardSpace
-from core_types import RewardType
-import numpy as np
 
 
 class RewardClippingFilter(RewardFilter):
@@ -36,7 +37,7 @@ class RewardClippingFilter(RewardFilter):
         if clipping_low > clipping_high:
             raise ValueError("The reward clipping low must be lower than the reward clipping max")
 
-    def filter(self, reward: RewardType) -> RewardType:
+    def filter(self, reward: RewardType, update_internal_state: bool=True) -> RewardType:
         reward = float(reward)
 
         if self.clipping_high:

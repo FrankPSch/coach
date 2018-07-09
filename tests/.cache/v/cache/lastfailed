@@ -1,4 +1,0 @@
-{
-  "block_factories/test_custom_actor_critic_factory.py::test_basic_rl_factory_multithreaded_with_pong_a3c": true,
-  "presets/test_presets.py::test_all_presets_are_running": true
-}

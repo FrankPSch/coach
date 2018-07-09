@@ -14,11 +14,13 @@
 # limitations under the License.
 #
 
+from typing import List
+
 import numpy as np
+
+from core_types import RunPhase, ActionType
 from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
 from spaces import ActionSpace
-from core_types import RunPhase, ActionType
-from typing import List
 
 
 # Based on on the description in:

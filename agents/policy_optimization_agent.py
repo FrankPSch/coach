@@ -13,13 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+from collections import OrderedDict
 from typing import Union
 
-from agents.agent import Agent
-from utils import Enum
-from logger import screen
-from collections import OrderedDict
 import numpy as np
+
+from agents.agent import Agent
+from core_types import Batch, ActionInfo
+from logger import screen
+from enum import Enum
+
+from spaces import DiscreteActionSpace, BoxActionSpace
+from utils import eps
 
 
 class PolicyGradientRescaler(Enum):
@@ -33,6 +39,9 @@ class PolicyGradientRescaler(Enum):
     DISCOUNTED_TD_RESIDUAL = 7
     GAE = 8
     CUSTOM_ACTOR_CRITIC = 9
+
+
+## This is an abstract agent - there is no learn_from_batch method ##
 
 
 class PolicyOptimizationAgent(Agent):
@@ -53,6 +62,7 @@ class PolicyOptimizationAgent(Agent):
     def log_to_screen(self):
         # log to screen
         log = OrderedDict()
+        log["Name"] = self.full_name_id
         if self.task_id is not None:
             log["Worker"] = self.task_id
         log["Episode"] = self.current_episode
@@ -75,13 +85,13 @@ class PolicyOptimizationAgent(Agent):
         self.std_discounted_return = np.std(episode_discounted_returns)
 
     def train(self):
-        episode = self.memory.get_episode(0)
+        episode = self.call_memory('get_episode', 0)
 
         if not episode:
             return
 
         # check if we should calculate gradients or skip
-        episode_ended = self.memory.num_complete_episodes() >= 1
+        episode_ended = self.call_memory('num_complete_episodes') >= 1
         num_steps_passed_since_last_update = episode.length() - self.last_gradient_update_step_idx
         is_t_max_steps_passed = num_steps_passed_since_last_update >= self.ap.algorithm.num_steps_between_gradient_updates
         if not (is_t_max_steps_passed or episode_ended):
@@ -91,7 +101,7 @@ class PolicyOptimizationAgent(Agent):
         if num_steps_passed_since_last_update > 0:
 
             # we need to update the returns of the episode until now
-            episode.update_returns(self.ap.algorithm.discount)
+            episode.update_returns()
 
             # get t_max transitions or less if the we got to a terminal state
             # will be used for both actor-critic and vanilla PG.
@@ -111,7 +121,8 @@ class PolicyOptimizationAgent(Agent):
                 self.update_episode_statistics(episode)
 
             # accumulate the gradients and apply them once in every apply_gradients_every_x_episodes episodes
-            total_loss, losses, unclipped_grads = self.learn_from_batch(transitions)
+            batch = Batch(transitions)
+            total_loss, losses, unclipped_grads = self.learn_from_batch(batch)
             if self.current_episode % self.ap.algorithm.apply_gradients_every_x_episodes == 0:
                 for network in self.networks.values():
                     network.apply_gradients_and_sync_networks()
@@ -122,7 +133,35 @@ class PolicyOptimizationAgent(Agent):
             # we need to remove the episode, because the next training iteration will be called before storing any
             # additional transitions in the memory (we don't store a transition for the first call to observe), so the
             # length of the memory won't be enforced and the old episode won't be removed
-            self.memory.remove_episode(0)
+            self.call_memory('remove_episode', 0)
             self.last_gradient_update_step_idx = 0
 
         return total_loss
+
+    def learn_from_batch(self, batch):
+        raise NotImplementedError("PolicyOptimizationAgent is an abstract agent. Not to be used directly.")
+
+    def get_prediction(self, states):
+        tf_input_state = self.prepare_batch_for_inference(states, "main")
+        return self.networks['main'].online_network.predict(tf_input_state)
+
+    def choose_action(self, curr_state):
+        # convert to batch so we can run it through the network
+        action_values = self.get_prediction(curr_state)
+        if isinstance(self.spaces.action, DiscreteActionSpace):
+            # DISCRETE
+            action_probabilities = np.array(action_values).squeeze()
+            action = self.exploration_policy.get_action(action_probabilities)
+            action_info = ActionInfo(action=action,
+                                     action_probability=action_probabilities[action])
+
+            self.entropy.add_sample(-np.sum(action_probabilities * np.log(action_probabilities + eps)))
+        elif isinstance(self.spaces.action, BoxActionSpace):
+            # CONTINUOUS
+            action = self.exploration_policy.get_action(action_values)
+
+            action_info = ActionInfo(action=action)
+        else:
+            raise ValueError("The action space of the environment is not compatible with the algorithm")
+
+        return action_info

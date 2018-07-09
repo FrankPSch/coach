@@ -1,26 +1,31 @@
 # nasty hack to deal with issue #46
 import os
 import sys
+
+from spaces import GoalsActionSpace, ReachingGoal
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 # print(sys.path)
 
 import pytest
 import numpy as np
 
-from core_types import Transition, GoalTypes
-from memories.memory import Episode, MemoryGranularity
+from core_types import Transition, GoalTypes, Episode
+from memories.memory import MemoryGranularity
 from memories.hindsight_experience_replay import HindsightExperienceReplay, HindsightExperienceReplayParameters, \
     HindsightGoalSelectionMethod
 
 
+#TODO: change from defining a new class to creating an instance from the parameters
 class Parameters(HindsightExperienceReplayParameters):
     def __init__(self):
         super().__init__()
         self.max_size = (MemoryGranularity.Transitions, 100)
         self.hindsight_transitions_per_regular_transition = 4
         self.hindsight_goal_selection_method = HindsightGoalSelectionMethod.Future
-        self.goal_type = 'observation'#GoalTypes.Observation
-        self.distance_from_goal_threshold = 0.1
+        self.goals_action_space = GoalsActionSpace(goal_type='observation',
+                                             reward_type=ReachingGoal(distance_from_goal_threshold=0.1),
+                                             distance_metric=GoalsActionSpace.DistanceMetric.Euclidean)
 
 
 @pytest.fixture
@@ -28,7 +33,7 @@ def episode():
     episode = []
     for i in range(10):
         episode.append(Transition(
-            state={'observation': np.array([i]), 'goal': np.array([i])},
+            state={'observation': np.array([i]), 'desired_goal': np.array([i]), 'achieved_goal': np.array([i])},
             action=i,
         ))
     return episode
@@ -65,7 +70,7 @@ def test_sample_goal_range(her, episode):
 def test_update_episode(her):
     for i in range(10):
         her.store(Transition(
-            state={'observation': np.array([i]), 'goal': np.array([i + 1])},
+            state={'observation': np.array([i]), 'desired_goal': np.array([i+1]), 'achieved_goal': np.array([i+1])},
             goal=np.array([i + 1]),
             action=i,
             game_over=i == 9,
@@ -78,8 +83,8 @@ def test_update_episode(her):
 
     # make sure that the goal state was never sampled from the past
     for transition in her.transitions:
-        assert transition.state['goal'] > transition.state['observation']
-        assert transition.next_state['goal'] >= transition.next_state['observation']
+        assert transition.state['desired_goal'] > transition.state['observation']
+        assert transition.next_state['desired_goal'] >= transition.next_state['observation']
 
         if transition.reward == 0:
             assert transition.game_over

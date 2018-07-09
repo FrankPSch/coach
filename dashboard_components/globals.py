@@ -2,7 +2,7 @@ import os
 from genericpath import isdir, isfile
 from os import listdir
 from os.path import join
-from utils import Enum
+from enum import Enum
 from bokeh.models import Div
 from bokeh.plotting import curdoc
 import wx

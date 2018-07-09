@@ -21,13 +21,13 @@ def test_filter():
     squeeze_filter_with_axis.add_observation_filter('observation', 'squeeze', ObservationSqueezeFilter(2))
 
     observation = np.random.rand(20, 30, 1, 3)
-    env_response = EnvResponse(new_state={'observation': observation}, reward=0, game_over=False)
+    env_response = EnvResponse(next_state={'observation': observation}, reward=0, game_over=False)
 
-    result = squeeze_filter.filter(env_response)
-    result_with_axis = squeeze_filter_with_axis.filter(env_response)
-    unfiltered_observation_shape = env_response.new_state['observation'].shape
-    filtered_observation_shape = result.new_state['observation'].shape
-    filtered_observation_with_axis_shape = result_with_axis.new_state['observation'].shape
+    result = squeeze_filter.filter(env_response)[0]
+    result_with_axis = squeeze_filter_with_axis.filter(env_response)[0]
+    unfiltered_observation_shape = env_response.next_state['observation'].shape
+    filtered_observation_shape = result.next_state['observation'].shape
+    filtered_observation_with_axis_shape = result_with_axis.next_state['observation'].shape
 
     # make sure the original observation is unchanged
     assert unfiltered_observation_shape == observation.shape
@@ -37,10 +37,10 @@ def test_filter():
     assert filtered_observation_with_axis_shape == (20, 30, 3)
 
     observation = np.random.rand(1, 30, 1, 3)
-    env_response = EnvResponse(new_state={'observation': observation}, reward=0, game_over=False)
+    env_response = EnvResponse(next_state={'observation': observation}, reward=0, game_over=False)
 
-    result = squeeze_filter.filter(env_response)
-    assert result.new_state['observation'].shape == (30, 3)
+    result = squeeze_filter.filter(env_response)[0]
+    assert result.next_state['observation'].shape == (30, 3)
 
 
 @pytest.mark.unit_test

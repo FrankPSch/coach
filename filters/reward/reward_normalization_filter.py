@@ -15,11 +15,12 @@
 #
 
 
+import numpy as np
+
 from architectures.tensorflow_components.shared_variables import SharedRunningStats
 from core_types import RewardType
 from filters.reward.reward_filter import RewardFilter
 from spaces import RewardSpace
-import numpy as np
 
 
 class RewardNormalizationFilter(RewardFilter):
@@ -53,8 +54,9 @@ class RewardNormalizationFilter(RewardFilter):
         """
         self.running_rewards_stats.set_session(sess)
 
-    def filter(self, reward: RewardType) -> RewardType:
-        self.running_rewards_stats.push(reward)
+    def filter(self, reward: RewardType, update_internal_state: bool=True) -> RewardType:
+        if update_internal_state:
+            self.running_rewards_stats.push(reward)
 
         reward = (reward - self.running_rewards_stats.mean) / \
                       (self.running_rewards_stats.std + 1e-15)

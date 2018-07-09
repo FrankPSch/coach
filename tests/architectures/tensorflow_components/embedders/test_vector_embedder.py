@@ -51,7 +51,7 @@ def test_embedder(reset):
 @pytest.mark.unit_test
 def test_complex_embedder(reset):
     # creating a deep vector embedder
-    embedder = VectorEmbedder(np.array([10]), name="test", embedder_scheme=EmbedderScheme.Deep)
+    embedder = VectorEmbedder(np.array([10]), name="test", scheme=EmbedderScheme.Deep)
 
     # call the embedder
     embedder()
@@ -67,7 +67,7 @@ def test_complex_embedder(reset):
 @pytest.mark.unit_test
 def test_activation_function(reset):
     # creating a deep vector embedder with relu
-    embedder = VectorEmbedder(np.array([10]), name="relu", embedder_scheme=EmbedderScheme.Deep,
+    embedder = VectorEmbedder(np.array([10]), name="relu", scheme=EmbedderScheme.Deep,
                               activation_function=tf.nn.relu)
 
     # call the embedder
@@ -81,7 +81,7 @@ def test_activation_function(reset):
     assert np.all(output >= 0)  # should have flattened the input
 
     # creating a deep vector embedder with tanh
-    embedder_tanh = VectorEmbedder(np.array([10]), name="tanh", embedder_scheme=EmbedderScheme.Deep,
+    embedder_tanh = VectorEmbedder(np.array([10]), name="tanh", scheme=EmbedderScheme.Deep,
                                    activation_function=tf.nn.tanh)
 
     # call the embedder

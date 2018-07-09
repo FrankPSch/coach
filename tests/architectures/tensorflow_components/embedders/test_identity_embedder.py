@@ -1,7 +1,7 @@
 import os
 import sys
 
-from configurations import EmbedderScheme
+from base_parameters import EmbedderScheme
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -20,7 +20,7 @@ def reset():
 
 @pytest.mark.unit_test
 def test_embedder(reset):
-    embedder = VectorEmbedder(np.array([10, 10]), name="test", embedder_scheme=EmbedderScheme.Empty)
+    embedder = VectorEmbedder(np.array([10, 10]), name="test", scheme=EmbedderScheme.Empty)
 
     # make sure the ops where not created yet
     assert len(tf.get_default_graph().get_operations()) == 0

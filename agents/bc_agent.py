@@ -13,16 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.imitation_agent import ImitationAgent
 import numpy as np
 
+from agents.imitation_agent import ImitationAgent
+from architectures.tensorflow_components.heads.policy_head import PolicyHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AgentParameters, AlgorithmParameters, NetworkParameters, InputEmbedderParameters, \
+     MiddlewareScheme
 from exploration_policies.e_greedy import EGreedyParameters
 from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
-from spaces import Discrete
-from configurations import AgentParameters, AlgorithmParameters, NetworkParameters, InputEmbedderParameters, \
-    MiddlewareTypes, EmbedderScheme, OutputTypes
 
 
 class BCAlgorithmParameters(AlgorithmParameters):
@@ -34,16 +36,13 @@ class BCAlgorithmParameters(AlgorithmParameters):
 class BCNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.embedder_scheme = EmbedderScheme.Medium
-        self.output_types = [OutputTypes.Pi]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.middleware_parameters = FCMiddlewareParameters(scheme=MiddlewareScheme.Medium)
+        self.heads_parameters = [PolicyHeadParameters()]
         self.loss_weights = [1.0]
         self.optimizer_type = 'Adam'
         self.batch_size = 32
-        self.hidden_layers_activation_function = 'relu'
         self.replace_mse_with_huber_loss = True  # TODO: need to try both
-        self.neon_support = True
         self.create_target_network = False
 
 
@@ -65,15 +64,17 @@ class BCAgent(ImitationAgent):
         super().__init__(agent_parameters, parent)
 
     def learn_from_batch(self, batch):
-        current_states, _, actions, _, _, _ = self.extract_batch(batch, "main")
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # When using a policy head, the targets refer to the advantages that we are normally feeding the head with.
         # In this case, we need the policy head to just predict probabilities, so while we usually train the network
         # with log(Pi)*Advantages, in this specific case we will train it to log(Pi), which after the softmax will
         # predict Pi (=probabilities)
-        targets = np.ones(actions.shape[0])
+        targets = np.ones(batch.actions().shape[0])
 
-        result = self.networks['main'].train_and_sync_networks({**current_states, 'output_0_0': actions}, targets)
+        result = self.networks['main'].train_and_sync_networks({**batch.states(network_keys),
+                                                                'output_0_0': batch.actions()},
+                                                               targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads

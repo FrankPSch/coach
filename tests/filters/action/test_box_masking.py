@@ -4,7 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pytest
 from filters.action.box_masking import BoxMasking
-from spaces import Box, Discrete
+from spaces import BoxActionSpace, DiscreteActionSpace
 import numpy as np
 
 
@@ -14,10 +14,10 @@ def test_filter():
 
     # passing an output space that is wrong
     with pytest.raises(ValueError):
-        filter.validate_output_action_space(Discrete(10))
+        filter.validate_output_action_space(DiscreteActionSpace(10))
 
     # 1 dimensional box
-    output_space = Box(1, 5, 30)
+    output_space = BoxActionSpace(1, 5, 30)
     input_space = filter.get_unfiltered_action_space(output_space)
 
     action = np.array([2])

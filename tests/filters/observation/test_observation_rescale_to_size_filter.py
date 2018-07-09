@@ -16,16 +16,16 @@ from filters.filter import InputFilter
 @pytest.mark.unit_test
 def test_filter():
     # make an RGB observation smaller
-    transition = EnvResponse(new_state={'observation': np.ones([20, 30, 3])}, reward=0, game_over=False)
+    transition = EnvResponse(next_state={'observation': np.ones([20, 30, 3])}, reward=0, game_over=False)
     rescale_filter = InputFilter()
     rescale_filter.add_observation_filter('observation', 'rescale',
                                          ObservationRescaleToSizeFilter(ImageObservationSpace(np.array([10, 20, 3]),
                                                                                               high=255),
                                                     RescaleInterpolationType.BILINEAR))
 
-    result = rescale_filter.filter(transition)
-    unfiltered_observation = transition.new_state['observation']
-    filtered_observation = result.new_state['observation']
+    result = rescale_filter.filter(transition)[0]
+    unfiltered_observation = transition.next_state['observation']
+    filtered_observation = result.next_state['observation']
 
     # make sure the original observation is unchanged
     assert unfiltered_observation.shape == (20, 30, 3)
@@ -35,14 +35,14 @@ def test_filter():
     assert np.all(filtered_observation == np.ones([10, 20, 3]))
 
     # make a grayscale observation bigger
-    transition = EnvResponse(new_state={'observation': np.ones([20, 30])}, reward=0, game_over=False)
+    transition = EnvResponse(next_state={'observation': np.ones([20, 30])}, reward=0, game_over=False)
     rescale_filter = InputFilter()
     rescale_filter.add_observation_filter('observation', 'rescale',
                                          ObservationRescaleToSizeFilter(ImageObservationSpace(np.array([40, 60]),
                                                                                               high=255),
                                                     RescaleInterpolationType.BILINEAR))
-    result = rescale_filter.filter(transition)
-    filtered_observation = result.new_state['observation']
+    result = rescale_filter.filter(transition)[0]
+    filtered_observation = result.next_state['observation']
 
     # validate the shape of the filtered observation
     assert filtered_observation.shape == (40, 60)

@@ -23,11 +23,11 @@ def rgb_to_y_filter():
 def test_filter(rgb_to_y_filter):
     # convert RGB observation to graysacle
     observation = np.random.rand(20, 30, 3)*255.0
-    transition = EnvResponse(new_state={'observation': observation}, reward=0, game_over=False)
+    transition = EnvResponse(next_state={'observation': observation}, reward=0, game_over=False)
 
-    result = rgb_to_y_filter.filter(transition)
-    unfiltered_observation = transition.new_state['observation']
-    filtered_observation = result.new_state['observation']
+    result = rgb_to_y_filter.filter(transition)[0]
+    unfiltered_observation = transition.next_state['observation']
+    filtered_observation = result.next_state['observation']
 
     # make sure the original observation is unchanged
     assert unfiltered_observation.shape == (20, 30, 3)

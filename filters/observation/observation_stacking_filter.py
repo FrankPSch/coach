@@ -14,12 +14,14 @@
 # limitations under the License.
 #
 
-from filters.observation.observation_filter import ObservationFilter
-from spaces import ObservationSpace
-from core_types import ObservationType
-import numpy as np
 import copy
 from collections import deque
+
+import numpy as np
+
+from core_types import ObservationType
+from filters.observation.observation_filter import ObservationFilter
+from spaces import ObservationSpace
 
 
 class LazyStack(object):
@@ -81,12 +83,13 @@ class ObservationStackingFilter(ObservationFilter):
         if input_observation_space.num_dimensions <= self.stacking_axis:
             raise ValueError("The stacking axis is larger than the number of dimensions in the observation space")
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
 
         if len(self.stack) == 0:
             self.stack = deque([observation] * self.stack_size, maxlen=self.stack_size)
         else:
-            self.stack.append(observation)
+            if update_internal_state:
+                self.stack.append(observation)
         observation = LazyStack(self.stack, self.stacking_axis)
 
         return observation

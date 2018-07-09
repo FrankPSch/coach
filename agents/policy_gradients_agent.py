@@ -13,28 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.policy_optimization_agent import PolicyOptimizationAgent, PolicyGradientRescaler
 import numpy as np
-from core_types import RunPhase, ActionInfo
-from utils import Signal
-from spaces import Discrete, Box
-from self.logger import screen
-from utils import eps
-from configurations import NetworkParameters, InputTypes, MiddlewareTypes, OutputTypes, AlgorithmParameters, \
+
+from agents.policy_optimization_agent import PolicyOptimizationAgent, PolicyGradientRescaler
+from architectures.tensorflow_components.heads.policy_head import PolicyHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import NetworkParameters, AlgorithmParameters, \
     AgentParameters, InputEmbedderParameters
+from core_types import ActionInfo
 from exploration_policies.additive_noise import AdditiveNoiseParameters
+from logger import screen
 from memories.single_episode_buffer import SingleEpisodeBufferParameters
-from architectures.network_wrapper import NetworkWrapper
+from spaces import DiscreteActionSpace, BoxActionSpace
+from utils import eps
 
 
 class PolicyGradientNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.Pi]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.middleware_parameters = FCMiddlewareParameters()
+        self.heads_parameters = [PolicyHeadParameters()]
         self.loss_weights = [1.0]
         self.async_training = True
 
@@ -42,8 +44,7 @@ class PolicyGradientNetworkParameters(NetworkParameters):
 class PolicyGradientAlgorithmParameters(AlgorithmParameters):
     def __init__(self):
         super().__init__()
-        self.num_episodes_in_experience_replay = 2
-        self.policy_gradient_rescaler = 'FUTURE_RETURN_NORMALIZED_BY_TIMESTEP'
+        self.policy_gradient_rescaler = PolicyGradientRescaler.FUTURE_RETURN_NORMALIZED_BY_TIMESTEP
         self.apply_gradients_every_x_episodes = 5
         self.beta_entropy = 0
         self.num_steps_between_gradient_updates = 20000  # this is called t_max in all the papers
@@ -70,9 +71,10 @@ class PolicyGradientsAgent(PolicyOptimizationAgent):
 
     def learn_from_batch(self, batch):
         # batch contains a list of episodes to learn from
-        current_states, next_states, actions, rewards, game_overs, total_returns = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
-        for i in reversed(range(len(total_returns))):
+        total_returns = batch.total_returns()
+        for i in reversed(range(batch.size)):
             if self.policy_gradient_rescaler == PolicyGradientRescaler.TOTAL_RETURN:
                 total_returns[i] = total_returns[0]
             elif self.policy_gradient_rescaler == PolicyGradientRescaler.FUTURE_RETURN:
@@ -90,35 +92,16 @@ class PolicyGradientsAgent(PolicyOptimizationAgent):
                 screen.warning("WARNING: The requested policy gradient rescaler is not available")
 
         targets = total_returns
-        if type(self.spaces.action) != Discrete and len(actions.shape) < 2:
+        actions = batch.actions()
+        if type(self.spaces.action) != DiscreteActionSpace and len(actions.shape) < 2:
             actions = np.expand_dims(actions, -1)
 
         self.returns_mean.add_sample(np.mean(total_returns))
         self.returns_variance.add_sample(np.std(total_returns))
 
         result = self.networks['main'].online_network.accumulate_gradients(
-            {**current_states, 'output_0_0': actions}, targets
+            {**batch.states(network_keys), 'output_0_0': actions}, targets
         )
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads
-
-    def choose_action(self, curr_state):
-        # TODO: shouldn't this be inherited?
-        # convert to batch so we can run it through the network
-        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'main')
-        if isinstance(self.spaces.action, Discrete):
-            # DISCRETE
-            action_values = self.networks['main'].online_network.predict(tf_input_state).squeeze()
-            action = self.exploration_policy.get_action(action_values)
-            action_info = ActionInfo(action=action, action_probability=action_values[action])
-            self.entropy.add_sample(-np.sum(action_values * np.log(action_values + eps)))
-        elif isinstance(self.spaces.action, Box):
-            # CONTINUOUS
-            action_values = self.networks['main'].online_network.predict(tf_input_state).squeeze()
-            action = self.exploration_policy.get_action(action_values)
-            action_info = ActionInfo(action=action)
-        else:
-            raise ValueError("The action space of the environment is not compatible with the algorithm")
-
-        return action_info

@@ -15,16 +15,22 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
-from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head, normalized_columns_initializer
+
+from architectures.tensorflow_components.heads.head import Head, normalized_columns_initializer, HeadParameters
+from base_parameters import AgentParameters
 from core_types import ActionProbabilities
+from spaces import SpacesDefinition
+
+
+class PPOVHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='ppo_v_head_params'):
+        super().__init__(parameterized_class=PPOVHead, activation_function=activation_function, name=name)
 
 
 class PPOVHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'ppo_v_head'
         self.clip_likelihood_ratio_using_epsilon = agent_parameters.algorithm.clip_likelihood_ratio_using_epsilon
         self.return_type = ActionProbabilities

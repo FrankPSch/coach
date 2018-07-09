@@ -16,8 +16,8 @@
 
 import gym
 import numpy as np
-
-from utils import lower_under_to_upper
+import scipy.ndimage
+from utils import lower_under_to_upper, short_dynamic_import
 
 try:
     import roboschool
@@ -41,7 +41,7 @@ except ImportError:
 from typing import Dict, Any, Union
 from core_types import RunPhase
 from environments.environment import Environment, EnvironmentParameters, LevelSelection
-from spaces import Discrete, Box, ObservationSpace, ImageObservationSpace, MeasurementsObservationSpace, StateSpace
+from spaces import DiscreteActionSpace, BoxActionSpace, ImageObservationSpace, VectorObservationSpace, StateSpace
 from filters.filter import NoInputFilter, NoOutputFilter
 from filters.reward.reward_clipping_filter import RewardClippingFilter
 from filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
@@ -50,8 +50,8 @@ from filters.observation.observation_rgb_to_y_filter import ObservationRGBToYFil
 from filters.observation.observation_to_uint8_filter import ObservationToUInt8Filter
 from filters.filter import InputFilter
 import random
-from configurations import VisualizationParameters
-from collections import OrderedDict
+from base_parameters import VisualizationParameters
+from logger import screen
 
 
 # Parameters
@@ -104,10 +104,13 @@ class Mujoco(GymEnvironmentParameters):
 
 
 gym_mujoco_envs = ['inverted_pendulum', 'inverted_double_pendulum', 'reacher', 'hopper', 'walker2d', 'half_cheetah',
-                   'ant', 'swimmer', 'humanoid', 'humanoid_standup']
-mujoco_v1 = {e: "{}".format(lower_under_to_upper(e) + '-v1') for e in gym_mujoco_envs}
-mujoco_v1['walker2d'] = 'Walker2d-v1'
+                   'ant', 'swimmer', 'humanoid', 'humanoid_standup', 'pusher', 'thrower', 'striker']
 
+mujoco_v2 = {e: "{}".format(lower_under_to_upper(e) + '-v2') for e in gym_mujoco_envs}
+mujoco_v2['walker2d'] = 'Walker2d-v2'
+
+gym_fetch_envs = ['reach', 'slide', 'push', 'pick_and_place']
+fetch_v1 = {e: "{}".format('Fetch' + lower_under_to_upper(e) + '-v1') for e in gym_fetch_envs}
 
 """
 Bullet Environment Components
@@ -159,6 +162,7 @@ gym_atari_envs = ['air_raid', 'alien', 'amidar', 'assault', 'asterix', 'asteroid
                   'solaris', 'space_invaders', 'star_gunner', 'tennis', 'time_pilot', 'tutankham', 'up_n_down',
                   'venture', 'video_pinball', 'wizard_of_wor', 'yars_revenge', 'zaxxon']
 atari_deterministic_v4 = {e: "{}".format(lower_under_to_upper(e) + 'Deterministic-v4') for e in gym_atari_envs}
+atari_no_frameskip_v4 = {e: "{}".format(lower_under_to_upper(e) + 'NoFrameskip-v4') for e in gym_atari_envs}
 
 
 class MaxOverFramesAndFrameskipEnvWrapper(gym.Wrapper):
@@ -206,21 +210,51 @@ class GymEnvironment(Environment):
         self.max_over_num_frames = max_over_num_frames
         self.additional_simulator_parameters = additional_simulator_parameters
 
-        # load and initialize environment
+        # hide warnings
+        gym.logger.set_level(40)
+
+        """
+        load and initialize environment
+        environment ids can be defined in 3 ways:
+        1. Native gym environments like BreakoutDeterministic-v0 for example
+        2. Custom gym environments written and installed as python packages.
+           This environments should have a python module with a class inheriting gym.Env, implementing the
+           relevant functions (_reset, _step, _render) and defining the observation and action space
+           For example: my_environment_package:MyEnvironmentClass will run an environment defined in the
+           MyEnvironmentClass class
+        3. Custom gym environments written as an independent module which is not installed.
+           This environments should have a python module with a class inheriting gym.Env, implementing the
+           relevant functions (_reset, _step, _render) and defining the observation and action space.
+           For example: path_to_my_environment.sub_directory.my_module:MyEnvironmentClass will run an
+           environment defined in the MyEnvironmentClass class which is located in the module in the relative path
+           path_to_my_environment.sub_directory.my_module
+        """
         if ':' in self.env_id:
-            # load custom env
-            if self.additional_simulator_parameters:
-                self.env = gym.envs.registration.load(self.env_id)(**self.additional_simulator_parameters)
+            # custom environments
+            if '/' in self.env_id or '.' in self.env_id:
+                # environment in a an absolute path module written as a unix path or in a relative path module
+                # written as a python import path
+                env_class = short_dynamic_import(self.env_id)
             else:
-                self.env = gym.envs.registration.load(self.env_id)()
+                # environment in a python package
+                env_class = gym.envs.registration.load(self.env_id)
+
+            # instantiate the environment
+            if self.additional_simulator_parameters:
+                self.env = env_class(**self.additional_simulator_parameters)
+            else:
+                self.env = env_class()
         else:
             self.env = gym.make(self.env_id)
 
         # for classic control we want to use the native renderer because otherwise we will get 2 renderer windows
+        environment_to_always_use_with_native_rendering = ['classic_control', 'mujoco', 'robotics']
         self.native_rendering = self.native_rendering or \
-                                any([env in str(self.env.unwrapped.__class__) for env in ['classic_control']])
+                                any([env in str(self.env.unwrapped.__class__)
+                                     for env in environment_to_always_use_with_native_rendering])
         if self.native_rendering:
-            self.renderer.close()
+            if hasattr(self, 'renderer'):
+                self.renderer.close()
 
         # seed
         if self.seed is not None:
@@ -229,10 +263,17 @@ class GymEnvironment(Environment):
             random.seed(self.seed)
 
         # frame skip and max between consecutive frames
-        self.is_atari_env = 'Atari' in self.env.unwrapped.__str__()
+        self.is_robotics_env = 'robotics' in str(self.env.unwrapped.__class__)
+        self.is_mujoco_env = 'mujoco' in str(self.env.unwrapped.__class__)
+        self.is_atari_env = 'Atari' in str(self.env.unwrapped.__class__)
         self.timelimit_env_wrapper = self.env
         if self.is_atari_env:
             self.env.unwrapped.frameskip = 1  # this accesses the atari env that is wrapped with a timelimit wrapper env
+            if self.env_id == "SpaceInvadersDeterministic-v4" and self.frame_skip == 4:
+                screen.warning("Warning: The frame-skip for Space Invaders was automatically updated from 4 to 3. "
+                               "This is following the DQN paper where it was noticed that a frame-skip of 3 makes the "
+                               "laser rays disappear. To force frame-skip of 4, please use SpaceInvadersNoFrameskip-v4.")
+                self.frame_skip = 3
             self.env = MaxOverFramesAndFrameskipEnvWrapper(self.env,
                                                            frameskip=self.frame_skip,
                                                            max_over_num_frames=self.max_over_num_frames)
@@ -256,17 +297,17 @@ class GymEnvironment(Environment):
                     channels_axis=-1
                 )
             else:
-                self.state_space[observation_space_name] = MeasurementsObservationSpace(
+                self.state_space[observation_space_name] = VectorObservationSpace(
                     shape=observation_space.shape[0],
                     low=observation_space.low,
                     high=observation_space.high
                 )
-        if 'goal' in state_space.keys():
-            self.goal_space = self.state_space['goal']
+        if 'desired_goal' in state_space.keys():
+            self.goal_space = self.state_space['desired_goal']
 
         # actions
         if type(self.env.action_space) == gym.spaces.box.Box:
-            self.action_space = Box(
+            self.action_space = BoxActionSpace(
                 shape=self.env.action_space.shape,
                 low=self.env.action_space.low,
                 high=self.env.action_space.high
@@ -275,7 +316,7 @@ class GymEnvironment(Environment):
             actions_description = []
             if hasattr(self.env.unwrapped, 'get_action_meanings'):
                 actions_description = self.env.unwrapped.get_action_meanings()
-            self.action_space = Discrete(
+            self.action_space = DiscreteActionSpace(
                 num_actions=self.env.action_space.n,
                 descriptions=actions_description
             )
@@ -288,7 +329,7 @@ class GymEnvironment(Environment):
                 self.key_to_action = self.env.unwrapped.get_keys_to_action()
 
         # initialize the state by getting a new state from the environment
-        self.reset(True)
+        self.reset_internal_state(True)
 
         # render
         if self.is_rendered:
@@ -306,8 +347,8 @@ class GymEnvironment(Environment):
             self.timestep_limit = None
 
         # the info is only updated after the first step
-        self.state = self.step(self.action_space.default_action).new_state
-        self.state_space['measurements'] = MeasurementsObservationSpace(shape=len(self.info.keys()))
+        self.state = self.step(self.action_space.default_action).next_state
+        self.state_space['measurements'] = VectorObservationSpace(shape=len(self.info.keys()))
 
         if self.env.spec:
             if custom_reward_threshold is None:
@@ -315,7 +356,6 @@ class GymEnvironment(Environment):
 
     def _wrap_state(self, state):
         if not isinstance(self.env.observation_space, gym.spaces.Dict):
-            # TODO: add measurements and goal
             return {'observation': state}
         return state
 
@@ -330,11 +370,11 @@ class GymEnvironment(Environment):
                 self._press_fire()
             self._update_ale_lives()
         # TODO: update the measurements
-        if self.state and "goal" in self.state.keys():
-            self.goal = self.state['goal']
+        if self.state and "desired_goal" in self.state.keys():
+            self.goal = self.state['desired_goal']
 
     def _take_action(self, action):
-        if type(self.action_space) == Box:
+        if type(self.action_space) == BoxActionSpace:
             action = self.action_space.clip_action_to_space(action)
 
         self.state, self.reward, self.done, self.info = self.env.step(action)
@@ -354,7 +394,7 @@ class GymEnvironment(Environment):
             self.current_ale_lives = self.env.unwrapped.ale.lives()
             self.step(fire_action)
             if self.done:
-                self.reset()
+                self.reset_internal_state()
 
     def _update_ale_lives(self):
         if self.is_atari_env:
@@ -369,6 +409,7 @@ class GymEnvironment(Environment):
             self.state = self.env.reset()
             self.state = self._wrap_state(self.state)
             self._update_ale_lives()
+
         if self.is_atari_env:
             self._random_noop()
             self._press_fire()
@@ -376,8 +417,36 @@ class GymEnvironment(Environment):
         # initialize the number of lives
         self._update_ale_lives()
 
+    def _set_mujoco_camera(self, camera_idx: int):
+        """
+        This function can be used to set the camera for rendering the mujoco simulator
+        :param camera_idx: The index of the camera to use. Should be defined in the model
+        :return: None
+        """
+        if self.env.unwrapped.viewer.cam.fixedcamid != camera_idx and self.env.unwrapped.viewer._ncam > camera_idx:
+            from mujoco_py.generated import const
+            self.env.unwrapped.viewer.cam.type = const.CAMERA_FIXED
+            self.env.unwrapped.viewer.cam.fixedcamid = camera_idx
+
+    def _get_robotics_image(self):
+        self.env.render()
+        image = self.env.unwrapped._get_viewer().read_pixels(1600, 900, depth=False)[::-1, :, :]
+        image = scipy.misc.imresize(image, (270, 480, 3))
+        return image
+
     def _render(self):
         self.env.render(mode='human')
+        # required for setting up a fixed camera for mujoco
+        if self.is_mujoco_env:
+            self._set_mujoco_camera(0)
 
     def get_rendered_image(self):
-        return self.env.render(mode='rgb_array')
+        if self.is_robotics_env:
+            # necessary for fetch since the rendered image is cropped to an irrelevant part of the simulator
+            image = self._get_robotics_image()
+        else:
+            image = self.env.render(mode='rgb_array')
+        # required for setting up a fixed camera for mujoco
+        if self.is_mujoco_env:
+            self._set_mujoco_camera(0)
+        return image

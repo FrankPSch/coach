@@ -2,7 +2,7 @@ annoy==1.8.3
 Pillow==4.3.0
 matplotlib==2.0.2
 numpy==1.13.0
-pandas==0.20.2
+pandas==0.22.0
 pygame==1.9.3
 PyOpenGL==3.1.0
 scipy==0.19.0

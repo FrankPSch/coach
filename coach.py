@@ -16,67 +16,67 @@
 
 import sys
 
-from agents.human_agent import HumanAgentParameters
-from block_factories.basic_rl_factory import BasicRLFactory
-from core_types import TrainingSteps, Episodes, EnvironmentSteps
-from environments.environment import EnvironmentParameters, SingleLevelSelection
+from core_types import EnvironmentSteps
 
 sys.path.append('.')
-import re
 import os
-import json
 import logger
+import traceback
 from logger import screen, failed_imports
 import argparse
 import atexit
+import time
 import sys
-from configurations import Frameworks, VisualizationParameters
+from base_parameters import Frameworks, VisualizationParameters, TaskParameters, DistributedTaskParameters
 from multiprocessing import Process
 from multiprocessing.managers import BaseManager
 import subprocess
-from block_scheduler import start_block, HumanPlayBlockSchedulerParameters
-from block_factories.block_factory import TaskParameters, DistributedTaskParameters
+from graph_managers.graph_manager import HumanPlayScheduleParameters, GraphManager
 from utils import list_all_presets, short_dynamic_import, get_open_port, SharedMemoryScratchPad
+from agents.human_agent import HumanAgentParameters
+from graph_managers.basic_rl_graph_manager import BasicRLGraphManager
+from environments.environment import SingleLevelSelection
 
 
 if len(set(failed_imports)) > 0:
     screen.warning("Warning: failed to import the following packages - {}".format(', '.join(set(failed_imports))))
 
 
-def get_block_factory_from_args(args: argparse.Namespace) -> 'BlockFactory':
+def get_graph_manager_from_args(args: argparse.Namespace) -> 'GraphManager':
     """
-    Return the block factory according to the command line arguments given by the user
+    Return the graph manager according to the command line arguments given by the user
     :param args: the arguments given by the user
-    :return: the updated block factory
+    :return: the updated graph manager
     """
 
-    block_factory = None
+    graph_manager = None
 
-    # if a preset was given we will load the factory for the preset
+    # if a preset was given we will load the graph manager for the preset
     if args.preset is not None:
-        block_factory = short_dynamic_import(args.preset, ignore_module_case=True)
+        graph_manager = short_dynamic_import(args.preset, ignore_module_case=True)
 
-    # for human play we need to create a custom block factory
+    # for human play we need to create a custom graph manager
     if args.play:
         env_params = short_dynamic_import(args.environment_type, ignore_module_case=True)()
         env_params.human_control = True
-        schedule_params = HumanPlayBlockSchedulerParameters()
-        block_factory = BasicRLFactory(HumanAgentParameters(), env_params, schedule_params, VisualizationParameters())
+        schedule_params = HumanPlayScheduleParameters()
+        graph_manager = BasicRLGraphManager(HumanAgentParameters(), env_params, schedule_params, VisualizationParameters())
 
     if args.level:
-        if isinstance(block_factory.env_params.level, SingleLevelSelection):
-            block_factory.env_params.level.select(args.level)
+        if isinstance(graph_manager.env_params.level, SingleLevelSelection):
+            graph_manager.env_params.level.select(args.level)
         else:
-            block_factory.env_params.level = args.level
+            graph_manager.env_params.level = args.level
 
     # set the seed for the environment
     if args.seed:
-        block_factory.env_params.seed = args.seed
+        graph_manager.env_params.seed = args.seed
 
     # visualization
-    block_factory.vis_params.dump_gifs = args.dump_gifs
-    block_factory.vis_params.render = args.render
-    block_factory.vis_params.tensorboard = args.tensorboard
+    graph_manager.visualization_parameters.dump_gifs = graph_manager.visualization_parameters.dump_gifs or args.dump_gifs
+    graph_manager.visualization_parameters.dump_mp4 = graph_manager.visualization_parameters.dump_mp4 or args.dump_mp4
+    graph_manager.visualization_parameters.render = args.render
+    graph_manager.visualization_parameters.tensorboard = args.tensorboard
 
     # update the custom parameters
     if args.custom_parameter is not None:
@@ -86,9 +86,9 @@ def get_block_factory_from_args(args: argparse.Namespace) -> 'BlockFactory':
 
         # load custom parameters into run_dict
         for key, value in stripped_key_value_pairs:
-            exec("block_factory.{}={}".format(key, value))
+            exec("graph_manager.{}={}".format(key, value))
 
-    return block_factory
+    return graph_manager
 
 
 def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
@@ -108,17 +108,19 @@ def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
     preset_names = list_all_presets()
     if args.list:
         screen.log_title("Available Presets:")
-        for preset in preset_names:
+        for preset in sorted(preset_names):
             print(preset)
         sys.exit(0)
 
     # replace a short preset name with the full path
     if args.preset is not None:
         if args.preset.lower() in [p.lower() for p in preset_names]:
-            args.preset = "presets.{}:factory".format(args.preset)
+            args.preset = "presets/{}.py:graph_manager".format(args.preset)
+        else:
+            args.preset = "{}".format(args.preset)
 
         # verify that the preset exists
-        preset_path = args.preset.split(":")[0].replace('.', '/') + ".py"
+        preset_path = args.preset.split(":")[0]
         if not os.path.exists(preset_path):
             screen.error("The given preset ({}) cannot be found.".format(args.preset))
 
@@ -126,6 +128,7 @@ def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
         try:
             short_dynamic_import(args.preset, ignore_module_case=True)
         except TypeError as e:
+            traceback.print_exc()
             screen.error('Internal Error: ' + str(e) + "\n\nThe given preset ({}) cannot be instantiated."
                          .format(args.preset))
 
@@ -157,10 +160,10 @@ def parse_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
                        "The number of workers will be reduced to 1")
         args.num_workers = 1
 
-    args.framework = Frameworks().get(args.framework)
+    args.framework = Frameworks[args.framework.lower()]
 
     # checkpoints
-    args.save_model_dir = args.experiment_path if args.save_model_sec is not None else None
+    args.save_checkpoint_dir = args.experiment_path if args.save_checkpoint_secs is not None else None
 
     return args
 
@@ -173,10 +176,20 @@ def open_dashboard(experiment_path):
     subprocess.Popen(cmd, shell=True, executable="/bin/bash")
 
 
+def start_graph(graph_manager: 'GraphManager', task_parameters: 'TaskParameters'):
+    graph_manager.create_graph(task_parameters)
+
+    # let the adventure begin
+    if task_parameters.evaluate_only:
+        graph_manager.evaluate(EnvironmentSteps(sys.maxsize), keep_networks_in_sync=True)
+    else:
+        graph_manager.improve()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--preset',
-                        help="(string) Name of a preset to run (as configured in presets.py)",
+                        help="(string) Name of a preset to run (class name from the 'presets' directory.)",
                         default=None,
                         type=str)
     parser.add_argument('-l', '--list',
@@ -190,13 +203,21 @@ if __name__ == "__main__":
                         help="(flag) Render environment",
                         action='store_true')
     parser.add_argument('-f', '--framework',
-                        help="(string) Neural network framework. Available values: tensorflow, neon",
+                        help="(string) Neural network framework. Available values: tensorflow",
                         default='tensorflow',
                         type=str)
     parser.add_argument('-n', '--num_workers',
                         help="(int) Number of workers for multi-process based agents, e.g. A3C",
                         default=1,
                         type=int)
+    parser.add_argument('-c', '--use_cpu',
+                        help="(flag) Use only the cpu for training. If a GPU is not available, this flag will have no "
+                             "effect and the CPU will be used either way.",
+                        action='store_true')
+    parser.add_argument('-ew', '--evaluation_worker',
+                        help="(int) If multiple workers are used, add an evaluation worker as well which will "
+                             "evaluate asynchronously during the training",
+                        action='store_true')
     parser.add_argument('--play',
                         help="(flag) Play as a human by controlling the game with the keyboard. "
                              "This option will save a replay buffer with the game play.",
@@ -205,10 +226,15 @@ if __name__ == "__main__":
                         help="(flag) Run evaluation only. This is a convenient way to disable "
                              "training in order to evaluate an existing checkpoint.",
                         action='store_true')
-    parser.add_argument('-v', '--verbose',
-                        help="(flag) Don't suppress TensorFlow debug prints.",
-                        action='store_true')
-    parser.add_argument('-s', '--save_model_sec',
+    parser.add_argument('-v', '--verbosity',
+                        help="(flag) Sets the verbosity level of Coach print outs. Can be either low or high.",
+                        default="low",
+                        type=str)
+    parser.add_argument('-tfv', '--tf_verbosity',
+                        help="(flag) TensorFlow verbosity level",
+                        default=3,
+                        type=int)
+    parser.add_argument('-s', '--save_checkpoint_secs',
                         help="(int) Time in seconds between saving checkpoints of the model.",
                         default=None,
                         type=int)
@@ -217,6 +243,9 @@ if __name__ == "__main__":
                         type=str)
     parser.add_argument('-dg', '--dump_gifs',
                         help="(flag) Enable the gif saving functionality.",
+                        action='store_true')
+    parser.add_argument('-dm', '--dump_mp4',
+                        help="(flag) Enable the mp4 saving functionality.",
                         action='store_true')
     parser.add_argument('-at', '--agent_type',
                         help="(string) Choose an agent type class to override on top of the selected preset. "
@@ -271,11 +300,11 @@ if __name__ == "__main__":
 
     args = parse_arguments(parser)
 
-    block_factory = get_block_factory_from_args(args)
+    graph_manager = get_graph_manager_from_args(args)
 
     # turn TF debug prints off
-    if not args.verbose and args.framework.lower() == 'tensorflow':
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    if args.framework == Frameworks.tensorflow:
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = str(args.tf_verbosity)
 
     # turn off the summary at the end of the run if necessary
     if not args.no_summary:
@@ -295,22 +324,26 @@ if __name__ == "__main__":
                                          seed=args.seed)
         task_parameters.__dict__.update(args.__dict__)
 
-        start_block(block_factory=block_factory, task_parameters=task_parameters)
+        start_graph(graph_manager=graph_manager, task_parameters=task_parameters)
 
     # Multi-threaded runs
     else:
+        total_tasks = args.num_workers
+        if args.evaluation_worker:
+            total_tasks += 1
+
         ps_hosts = "localhost:{}".format(get_open_port())
-        worker_hosts = ",".join(["localhost:{}".format(get_open_port()) for i in range(args.num_workers+1)])
+        worker_hosts = ",".join(["localhost:{}".format(get_open_port()) for i in range(total_tasks)])
 
         # Shared memory
         class CommManager(BaseManager):
             pass
-        CommManager.register('SharedMemoryScratchPad', SharedMemoryScratchPad, exposed=['add', 'get'])
+        CommManager.register('SharedMemoryScratchPad', SharedMemoryScratchPad, exposed=['add', 'get', 'internal_call'])
         comm_manager = CommManager()
         comm_manager.start()
         shared_memory_scratchpad = comm_manager.SharedMemoryScratchPad()
 
-        def start_distributed_task(job_type, task_index, evaluation_worker=False, use_cpu=True,
+        def start_distributed_task(job_type, task_index, evaluation_worker=False,
                                    shared_memory_scratchpad=shared_memory_scratchpad):
             # TODO: the use_cpu flag does not work correctly yet
             task_parameters = DistributedTaskParameters(framework_type="tensorflow", # TODO: tensorflow should'nt be hardcoded
@@ -319,21 +352,21 @@ if __name__ == "__main__":
                                                         job_type=job_type,
                                                         task_index=task_index,
                                                         evaluate_only=evaluation_worker,
-                                                        use_cpu=use_cpu,
-                                                        num_tasks=args.num_workers+1,  # training tasks + 1 evaluation task
+                                                        use_cpu=args.use_cpu,
+                                                        num_tasks=total_tasks,  # training tasks + 1 evaluation task
                                                         num_training_tasks=args.num_workers,
                                                         experiment_path=args.experiment_path,
                                                         shared_memory_scratchpad=shared_memory_scratchpad,
-                                                        seed=args.seed+task_index)  # each worker gets a different seed
+                                                        seed=args.seed+task_index if args.seed is not None else None)  # each worker gets a different seed
             task_parameters.__dict__.update(args.__dict__)
             # we assume that only the evaluation workers are rendering
-            block_factory.vis_params.render = args.render and evaluation_worker
-            p = Process(target=start_block, args=(block_factory, task_parameters))
+            graph_manager.visualization_parameters.render = args.render and evaluation_worker
+            p = Process(target=start_graph, args=(graph_manager, task_parameters))
             # TODO - should the processes be defined as daemons? This cause an issue with setting a distributed DND
             # through the scratchpad. Currently we do not add the DND to the scratchpad see (dnd_q_head for more info
             # on that), so we do not care about it being set to True.
 
-            p.daemon = True
+            # p.daemon = True
             p.start()
             return p
 
@@ -341,13 +374,18 @@ if __name__ == "__main__":
         parameter_server = start_distributed_task("ps", 0)
 
         # training workers
+        # wait a bit before spawning the non chief workers in order to make sure the session is already created
         workers = []
-        for task_index in range(args.num_workers):
+        workers.append(start_distributed_task("worker", 0))
+        time.sleep(2)
+        for task_index in range(1, args.num_workers):
             workers.append(start_distributed_task("worker", task_index))
 
         # evaluation worker
-        evaluation_worker = start_distributed_task("worker", args.num_workers, evaluation_worker=True)
+        if args.evaluation_worker:
+            evaluation_worker = start_distributed_task("worker", args.num_workers, evaluation_worker=True)
 
         # wait for all workers
         [w.join() for w in workers]
-        evaluation_worker.terminate()
+        if args.evaluation_worker:
+            evaluation_worker.terminate()

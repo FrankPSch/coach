@@ -14,10 +14,10 @@ from collections import OrderedDict
 
 @pytest.mark.unit_test
 def test_filter():
-    rescale_filter = InputFilter(reward_filters=OrderedDict([('rescale', RewardRescaleFilter(10.))]))
-    env_response = EnvResponse(new_state={'observation': np.zeros(10)}, reward=100, game_over=False)
+    rescale_filter = InputFilter(reward_filters=OrderedDict([('rescale', RewardRescaleFilter(1/10.))]))
+    env_response = EnvResponse(next_state={'observation': np.zeros(10)}, reward=100, game_over=False)
     print(rescale_filter.observation_filters)
-    result = rescale_filter.filter(env_response)
+    result = rescale_filter.filter(env_response)[0]
     unfiltered_reward = env_response.reward
     filtered_reward = result.reward
 
@@ -28,14 +28,14 @@ def test_filter():
     assert unfiltered_reward == 100
 
     # negative reward
-    env_response = EnvResponse(new_state={'observation': np.zeros(10)}, reward=-50, game_over=False)
-    result = rescale_filter.filter(env_response)
+    env_response = EnvResponse(next_state={'observation': np.zeros(10)}, reward=-50, game_over=False)
+    result = rescale_filter.filter(env_response)[0]
     assert result.reward == -5
 
 
 @pytest.mark.unit_test
 def test_get_filtered_reward_space():
-    rescale_filter = InputFilter(reward_filters=OrderedDict([('rescale', RewardRescaleFilter(10.))]))
+    rescale_filter = InputFilter(reward_filters=OrderedDict([('rescale', RewardRescaleFilter(1/10.))]))
 
     # reward is clipped
     reward_space = RewardSpace(1, -100, 100)

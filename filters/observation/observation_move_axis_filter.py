@@ -14,10 +14,11 @@
 # limitations under the License.
 #
 
+import numpy as np
+
+from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace, PlanarMapsObservationSpace
-from core_types import ObservationType
-import numpy as np
 
 
 class ObservationMoveAxisFilter(ObservationFilter):
@@ -34,7 +35,7 @@ class ObservationMoveAxisFilter(ObservationFilter):
         if not -len(shape) <= self.axis_origin < len(shape) or not -len(shape) <= self.axis_target < len(shape):
             raise ValueError("The given axis does not exist in the context of the input observation shape. ")
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
         return np.moveaxis(observation, self.axis_origin, self.axis_target)
 
     def get_filtered_observation_space(self, input_observation_space: ObservationSpace) -> ObservationSpace:

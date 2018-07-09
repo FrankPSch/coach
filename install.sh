@@ -155,7 +155,7 @@ if [ ${INSTALL_GYM} -eq 1 ]; then
     echo "Installing Gym support"
     sudo -E apt-get install libav-tools libsdl2-dev swig cmake -y
     pip3 install box2d # for bipedal walker etc.
-    pip3 install gym==0.9.4
+    pip3 install gym==0.10.5
 fi
 
 # NGraph and Neon

@@ -20,23 +20,22 @@ except ImportError:
     from logger import failed_imports
     failed_imports.append("ViZDoom")
 
-from collections import OrderedDict
 from os import path, environ
-from typing import Dict, Any, Union
-# environ['VIZDOOM_ROOT'] = '/home/cvds_lab/coach/coach_env/lib/python3.5/site-packages/vizdoom/'
+from typing import Union, List
+import os
+import numpy as np
+
+from base_parameters import VisualizationParameters
+from environments.environment import Environment, EnvironmentParameters, LevelSelection
+from filters.action.full_discrete_action_space_map import FullDiscreteActionSpaceMap
+from filters.filter import InputFilter, OutputFilter
+from filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
 from filters.observation.observation_rgb_to_y_filter import ObservationRGBToYFilter
 from filters.observation.observation_stacking_filter import ObservationStackingFilter
 from filters.observation.observation_to_uint8_filter import ObservationToUInt8Filter
-
-from configurations import VisualizationParameters
-from environments.environment import Environment, EnvironmentParameters, LevelSelection
-from filters.filter import InputFilter, OutputFilter
-from filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
-from filters.action.full_discrete_action_space_map import FullDiscreteActionSpaceMap
-from spaces import MultiSelect, ObservationSpace, ImageObservationSpace, \
-    MeasurementsObservationSpace, StateSpace
-from utils import Enum
-import numpy as np
+from spaces import MultiSelectActionSpace, ImageObservationSpace, \
+    VectorObservationSpace, StateSpace
+from enum import Enum
 
 
 # enum of the available levels and their path
@@ -50,6 +49,7 @@ class DoomLevel(Enum):
     HEALTH_GATHERING_SUPREME = "health_gathering_supreme.cfg"
     DEFEND_THE_LINE = "defend_the_line.cfg"
     DEADLY_CORRIDOR = "deadly_corridor.cfg"
+    BATTLE_COACH_LOCAL = "D3_battle.cfg"  # from https://github.com/IntelVCL/DirectFuturePrediction/tree/master/maps
 
 key_map = {
     'NO-OP': 96,  # `
@@ -107,6 +107,7 @@ class DoomEnvironmentParameters(EnvironmentParameters):
         super().__init__()
         self.default_input_filter = DoomInputFilter
         self.default_output_filter = DoomOutputFilter
+        self.cameras = [DoomEnvironment.CameraTypes.OBSERVATION]
 
     @property
     def path(self):
@@ -114,26 +115,35 @@ class DoomEnvironmentParameters(EnvironmentParameters):
 
 
 class DoomEnvironment(Environment):
+    class CameraTypes(Enum):
+        OBSERVATION = ("observation", "screen_buffer")
+        DEPTH = ("depth", "depth_buffer")
+        LABELS = ("labels", "labels_buffer")
+        MAP = ("map", "automap_buffer")
+
     def __init__(self, level: LevelSelection, seed: int, frame_skip: int, human_control: bool,
                  custom_reward_threshold: Union[int, float], visualization_parameters: VisualizationParameters,
-                 **kwargs):
+                 cameras: List[CameraTypes], **kwargs):
         super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
 
+        self.cameras = cameras
+
         # load the emulator with the required level
-        self.level = DoomLevel().get(level)
-        self.scenarios_dir = path.join(environ.get('VIZDOOM_ROOT'), 'scenarios')
+        self.level = DoomLevel[level.upper()]
+        local_scenarios_path = path.join(os.path.dirname(os.path.realpath(__file__)), 'doom')
+        self.scenarios_dir = local_scenarios_path if 'COACH_LOCAL' in level \
+            else path.join(environ.get('VIZDOOM_ROOT'), 'scenarios')
+
         self.game = vizdoom.DoomGame()
-        self.game.load_config(path.join(self.scenarios_dir, self.level))
+        self.game.load_config(path.join(self.scenarios_dir, self.level.value))
         self.game.set_window_visible(False)
         self.game.add_game_args("+vid_forcesurface 1")
 
         self.wait_for_explicit_human_action = True
         if self.human_control:
             self.game.set_screen_resolution(vizdoom.ScreenResolution.RES_640X480)
-            self.renderer.create_screen(640, 480)
         elif self.is_rendered:
             self.game.set_screen_resolution(vizdoom.ScreenResolution.RES_320X240)
-            self.renderer.create_screen(320, 240)
         else:
             # lower resolution since we actually take only 76x60 and we don't need to render
             self.game.set_screen_resolution(vizdoom.ScreenResolution.RES_160X120)
@@ -142,16 +152,19 @@ class DoomEnvironment(Environment):
         self.game.set_render_crosshair(False)
         self.game.set_render_decals(False)
         self.game.set_render_particles(False)
+        for camera in self.cameras:
+            if hasattr(self.game, 'set_{}_enabled'.format(camera.value[1])):
+                getattr(self.game, 'set_{}_enabled'.format(camera.value[1]))(True)
         self.game.init()
 
         # actions
         actions_description = ['NO-OP']
         actions_description += [str(action).split(".")[1] for action in self.game.get_available_buttons()]
         actions_description = actions_description[::-1]
-        self.action_space = MultiSelect(self.game.get_available_buttons_size(),
-                                        max_simultaneous_selected_actions=1,
-                                        descriptions=actions_description,
-                                        allow_no_action_to_be_selected=False)
+        self.action_space = MultiSelectActionSpace(self.game.get_available_buttons_size(),
+                                                   max_simultaneous_selected_actions=1,
+                                                   descriptions=actions_description,
+                                                   allow_no_action_to_be_selected=True)
 
         # human control
         if self.human_control:
@@ -163,26 +176,38 @@ class DoomEnvironment(Environment):
 
         # states
         self.state_space = StateSpace({
-            "observation": ImageObservationSpace(
-                                shape=np.array([self.game.get_screen_height(), self.game.get_screen_width(), 3]),
-                                high=255),
-            "measurements": MeasurementsObservationSpace(self.game.get_state().game_variables.shape[0])
+            "measurements": VectorObservationSpace(self.game.get_state().game_variables.shape[0],
+                                                   measurements_names=[str(m) for m in
+                                                                       self.game.get_available_game_variables()])
         })
+        for camera in self.cameras:
+            self.state_space[camera.value[0]] = ImageObservationSpace(
+                shape=np.array([self.game.get_screen_height(), self.game.get_screen_width(), 3]),
+                high=255)
 
         # seed
         if seed is not None:
             self.game.set_seed(seed)
-        self.reset()
+        self.reset_internal_state()
+
+        # render
+        if self.is_rendered:
+            image = self.get_rendered_image()
+            self.renderer.create_screen(image.shape[1], image.shape[0])
 
     def _update_state(self):
         # extract all data from the current state
         state = self.game.get_state()
         if state is not None and state.screen_buffer is not None:
-            self.observation = state.screen_buffer
-            # move the channel to the last axis
-            self.observation = np.transpose(self.observation, (1, 2, 0))
             self.measurements = state.game_variables
-            self.state = {'observation': state.screen_buffer, 'measurements': self.measurements}
+            self.state = {'measurements': self.measurements}
+            for camera in self.cameras:
+                observation = getattr(state, camera.value[1])
+                if len(observation.shape) == 3:
+                    self.state[camera.value[0]] = np.transpose(observation, (1, 2, 0))
+                elif len(observation.shape) == 2:
+                    self.state[camera.value[0]] = np.repeat(np.expand_dims(observation, -1), 3, axis=-1)
+
         self.reward = self.game.get_last_reward()
         self.done = self.game.is_episode_finished()
 
@@ -192,4 +217,12 @@ class DoomEnvironment(Environment):
     def _restart_environment_episode(self, force_environment_reset=False):
         self.game.new_episode()
 
-
+    def get_rendered_image(self) -> np.ndarray:
+        """
+        Return a numpy array containing the image that will be rendered to the screen.
+        This can be different from the observation. For example, mujoco's observation is a measurements vector.
+        :return: numpy array containing the image that will be rendered to the screen
+        """
+        image = [self.state[camera.value[0]] for camera in self.cameras]
+        image = np.vstack(image)
+        return image

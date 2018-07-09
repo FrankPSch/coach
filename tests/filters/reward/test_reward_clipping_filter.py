@@ -20,8 +20,8 @@ def clip_filter():
 
 @pytest.mark.unit_test
 def test_filter(clip_filter):
-    transition = EnvResponse(new_state={'observation': np.zeros(10)}, reward=100, game_over=False)
-    result = clip_filter.filter(transition)
+    transition = EnvResponse(next_state={'observation': np.zeros(10)}, reward=100, game_over=False)
+    result = clip_filter.filter(transition)[0]
     unfiltered_reward = transition.reward
     filtered_reward = result.reward
 
@@ -32,13 +32,13 @@ def test_filter(clip_filter):
     assert unfiltered_reward == 100
 
     # reward in bounds
-    transition = EnvResponse(new_state={'observation': np.zeros(10)}, reward=5, game_over=False)
-    result = clip_filter.filter(transition)
+    transition = EnvResponse(next_state={'observation': np.zeros(10)}, reward=5, game_over=False)
+    result = clip_filter.filter(transition)[0]
     assert result.reward == 5
 
     # reward below bounds
-    transition = EnvResponse(new_state={'observation': np.zeros(10)}, reward=-5, game_over=False)
-    result = clip_filter.filter(transition)
+    transition = EnvResponse(next_state={'observation': np.zeros(10)}, reward=-5, game_over=False)
+    result = clip_filter.filter(transition)[0]
     assert result.reward == 2
 
 

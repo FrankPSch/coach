@@ -19,11 +19,11 @@ def test_filter():
     uint8_filter.add_observation_filter('observation', 'to_uint8', ObservationToUInt8Filter(input_low=0, input_high=255))
 
     observation = np.random.rand(20, 30, 3)*255.0
-    env_response = EnvResponse(new_state={'observation': observation}, reward=0, game_over=False)
+    env_response = EnvResponse(next_state={'observation': observation}, reward=0, game_over=False)
 
-    result = uint8_filter.filter(env_response)
-    unfiltered_observation = env_response.new_state['observation']
-    filtered_observation = result.new_state['observation']
+    result = uint8_filter.filter(env_response)[0]
+    unfiltered_observation = env_response.next_state['observation']
+    filtered_observation = result.next_state['observation']
 
     # make sure the original observation is unchanged
     assert unfiltered_observation.dtype == 'float64'

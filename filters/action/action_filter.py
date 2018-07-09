@@ -1,31 +1,22 @@
+#
+# Copyright (c) 2017 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from core_types import ActionType
 from filters.filter import Filter
 from spaces import ActionSpace
-from core_types import ActionType
-
-# class ActionAdapter(object):
-#     """
-#     Maps an action space to another action space. This is useful when the action space of the environment (simulator)
-#     needs to be different than the action space of the agent.
-#     """
-#
-#     def __init__(self, source: ActionSpace, target: ActionSpace):
-#         self.source = source
-#         self.target = target
-#
-#     def transform(self, action: ActionType) -> ActionType:
-#         raise NotImplementedError("")
-#
-#     def __getattr__(self, item):
-#         """
-#         This will pass every requested function call to the source object if it is available there
-#         """
-#         available_attr = dir(ActionSpace)
-#         if 'source' in self.__dict__:
-#             available_attr += list(self.__dict__['source'].__dict__.keys())
-#         if item in available_attr:
-#             return getattr(self.__dict__['source'], item)
-#         else:
-#             return object.__getattribute__(self, item)
 
 
 class ActionFilter(Filter):

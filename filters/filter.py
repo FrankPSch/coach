@@ -17,13 +17,11 @@
 import copy
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Dict
+from typing import Dict, Union, List
 
-from core_types import EnvResponse, ActionInfo
-# from filters.observation.observation_filter import ObservationFilter
-# from filters.reward.reward_filter import RewardFilter
+from core_types import EnvResponse, ActionInfo, Transition
 from spaces import ActionSpace, RewardSpace, ObservationSpace
-from utils import call_method_for_all
+from utils import force_list
 
 
 class Filter(object):
@@ -37,10 +35,12 @@ class Filter(object):
         """
         pass
 
-    def filter(self, env_response: EnvResponse) -> EnvResponse:
+    def filter(self, env_response: Union[EnvResponse, Transition], update_internal_state: bool=True) \
+            -> Union[EnvResponse, Transition]:
         """
         Filter some values in the env and return the filtered env_response
         This is the function that each filter should update
+        :param update_internal_state: should the filter's internal state change due to this call
         :param env_response: the input env_response
         :return: the filtered env_response
         """
@@ -67,9 +67,12 @@ class OutputFilter(Filter):
     """
     An output filter is a module that filters the output from an agent to the environment.
     """
-    def __init__(self, action_filters: OrderedDict([(str, 'ActionFilter')])=OrderedDict([]),
+    def __init__(self, action_filters: OrderedDict([(str, 'ActionFilter')])=None,
                  is_a_reference_filter: bool=False):
         super().__init__()
+
+        if action_filters is None:
+            action_filters = OrderedDict([])
         self._action_filters = action_filters
 
         # TODO: update the comment
@@ -108,6 +111,8 @@ class OutputFilter(Filter):
         if self.i_am_a_reference_filter:
             raise Exception("The filter being used is a reference filter. It is not to be used directly. "
                             "Instead get a duplicate from it by calling __call__.")
+        if len(self.action_filters.values()) == 0:
+            return action_info
         filtered_action_info = copy.deepcopy(action_info)
         filtered_action = filtered_action_info.action
         for filter in reversed(self.action_filters.values()):
@@ -137,7 +142,6 @@ class OutputFilter(Filter):
         filtered_action_info.action = filtered_action
 
         return filtered_action_info
-
 
     def get_unfiltered_action_space(self, output_action_space: ActionSpace) -> ActionSpace:
         """
@@ -241,33 +245,60 @@ class InputFilter(Filter):
         [f.set_session(sess) for f in self.reward_filters.values()]
         [[f.set_session(sess) for f in filters.values()] for filters in self.observation_filters.values()]
 
-    def filter(self, env_response: EnvResponse) -> EnvResponse:
+    def filter(self, unfiltered_data: Union[EnvResponse, List[EnvResponse], Transition, List[Transition]],
+               update_internal_state: bool=True, deep_copy: bool=True) -> Union[List[EnvResponse], List[Transition]]:
         """
         A wrapper around _filter which first copies the env_response so that we don't change the original one
         This function should not be updated!
-        :param env_response: the input env_response
+        :param unfiltered_data: the input data
+        :param update_internal_state: should the filter's internal state change due to this call
         :return: the filtered env_response
         """
         if self.i_am_a_reference_filter:
             raise Exception("The filter being used is a reference filter. It is not to be used directly. "
                             "Instead get a duplicate from it by calling __call__.")
-        filtered_env_response = copy.deepcopy(env_response)
+        if deep_copy:
+            filtered_data = copy.deepcopy(unfiltered_data)
+        else:
+            filtered_data = [copy.copy(t) for t in unfiltered_data]
+        filtered_data = force_list(filtered_data)
 
         # TODO: implement observation space validation
         # filter observations
-        for observation_name, filtered_observation in filtered_env_response.new_state.items():
-            if observation_name in self._observation_filters.keys():
-                for filter in self._observation_filters[observation_name].values():
-                    filtered_observation = filter.filter(filtered_observation)
-                filtered_env_response.new_state[observation_name] = filtered_observation
+        if isinstance(filtered_data[0], Transition):
+            state_objects_to_filter = [[f.state for f in filtered_data],
+                                       [f.next_state for f in filtered_data]]
+        elif isinstance(filtered_data[0], EnvResponse):
+            state_objects_to_filter = [[f.next_state for f in filtered_data]]
+        else:
+            raise ValueError("unfiltered_data should be either of type EnvResponse or Transition. ")
+
+        for state_object_list in state_objects_to_filter:
+            for observation_name, filters in self._observation_filters.items():
+                if observation_name in state_object_list[0].keys():
+                    for filter in filters.values():
+                        data_to_filter = [state_object[observation_name] for state_object in state_object_list]
+                        if filter.supports_batching:
+                            filtered_observations = filter.filter(
+                                data_to_filter, update_internal_state=update_internal_state)
+                        else:
+                            filtered_observations = []
+                            for data_point in data_to_filter:
+                                filtered_observations.append(filter.filter(
+                                    data_point, update_internal_state=update_internal_state))
+
+                        for i, state_object in enumerate(state_object_list):
+                            state_object[observation_name] = filtered_observations[i]
 
         # filter reward
-        filtered_reward = filtered_env_response.reward
-        for filter in self._reward_filters.values():
-            filtered_reward = filter.filter(filtered_reward)
-        filtered_env_response.reward = filtered_reward
+        for f in filtered_data:
+            filtered_reward = f.reward
+            for filter in self._reward_filters.values():
+                filtered_reward = filter.filter(filtered_reward, update_internal_state)
+            f.reward = filtered_reward
 
-        return filtered_env_response
+        return filtered_data
+
 
     def get_filtered_observation_space(self, observation_name: str,
                                        input_observation_space: ObservationSpace) -> ObservationSpace:

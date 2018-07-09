@@ -1,5 +1,22 @@
-import tensorflow as tf
+#
+# Copyright (c) 2017 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 from typing import Tuple
+
+import tensorflow as tf
 
 
 def create_cluster_spec(parameters_server: str, workers: str) -> tf.train.ClusterSpec:
@@ -19,35 +36,39 @@ def create_cluster_spec(parameters_server: str, workers: str) -> tf.train.Cluste
     return cluster_spec
 
 
-def create_and_start_parameters_server(cluster_spec: tf.train.ClusterSpec) -> None:
+def create_and_start_parameters_server(cluster_spec: tf.train.ClusterSpec, config: tf.ConfigProto=None) -> None:
     """
     Create and start a parameter server
     :param cluster_spec: the ClusterSpec object representing the cluster
+    :param config: the tensorflow config to use
     :return: None
     """
     # create a server object for the parameter server
-    server = tf.train.Server(cluster_spec, job_name="ps", task_index=0, config=tf.ConfigProto())
+    server = tf.train.Server(cluster_spec, job_name="ps", task_index=0, config=config)
 
     # wait for the server to finish
     server.join()
 
 
 def create_worker_server_and_device(cluster_spec: tf.train.ClusterSpec, task_index: int,
-                                    use_cpu: bool=True) -> Tuple[str, tf.device]:
+                                    use_cpu: bool=True, config: tf.ConfigProto=None) -> Tuple[str, tf.device]:
     """
     Creates a worker server and a device setter used to assign the workers operations to
     :param cluster_spec: a ClusterSpec object representing the cluster
     :param task_index: the index of the worker task
     :param use_cpu: if use_cpu=True, all the agent operations will be assigned to a CPU instead of a GPU
+    :param config: the tensorflow config to use
     :return: the target string for the tf.Session and the worker device setter object
     """
     # Create and start a worker
-    server = tf.train.Server(cluster_spec, job_name="worker", task_index=task_index)
+    server = tf.train.Server(cluster_spec, job_name="worker", task_index=task_index, config=config)
 
     # Assign ops to the local worker
     worker_device = "/job:worker/task:{}".format(task_index)
     if use_cpu:
         worker_device += "/cpu:0"
+    else:
+        worker_device += "/device:GPU:0"
     device = tf.train.replica_device_setter(worker_device=worker_device, cluster=cluster_spec)
 
     return server.target, device

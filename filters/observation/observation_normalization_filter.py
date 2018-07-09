@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from typing import List
 
+import numpy as np
 
 from architectures.tensorflow_components.shared_variables import SharedRunningStats
 from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace
-import numpy as np
 
 
 class ObservationNormalizationFilter(ObservationFilter):
@@ -27,7 +28,7 @@ class ObservationNormalizationFilter(ObservationFilter):
     Normalize the observation with a running standard deviation and mean of the observations seen so far
     If there is more than a single worker, the statistics of the observations are shared between all the workers
     """
-    def __init__(self, clip_min: float=-5.0, clip_max: float=5.0):
+    def __init__(self, clip_min: float=-5.0, clip_max: float=5.0, name='observation_stats'):
         """
         :param clip_min: The minimum value to allow after normalizing the observation
         :param clip_max: The maximum value to allow after normalizing the observation
@@ -36,6 +37,9 @@ class ObservationNormalizationFilter(ObservationFilter):
         self.clip_min = clip_min
         self.clip_max = clip_max
         self.running_observation_stats = None
+        self.name = name
+        self.supports_batching = True
+        self.observation_space = None
 
     def set_device(self, device) -> None:
         """
@@ -43,7 +47,7 @@ class ObservationNormalizationFilter(ObservationFilter):
         :param device: the device to use
         :return: None
         """
-        self.running_observation_stats = SharedRunningStats(device, name='observation_stats')
+        self.running_observation_stats = SharedRunningStats(device, name=self.name, create_ops=False)
 
     def set_session(self, sess) -> None:
         """
@@ -53,14 +57,17 @@ class ObservationNormalizationFilter(ObservationFilter):
         """
         self.running_observation_stats.set_session(sess)
 
-    def filter(self, observation: ObservationType) -> ObservationType:
-        self.running_observation_stats.push(observation)
+    def filter(self, observations: List[ObservationType], update_internal_state: bool=True) -> ObservationType:
+        observations = np.array(observations)
+        if update_internal_state:
+            self.running_observation_stats.push(observations)
+            self.last_mean = self.running_observation_stats.mean
+            self.last_stdev = self.running_observation_stats.std
 
-        observation = (observation - self.running_observation_stats.mean) / \
-                      (self.running_observation_stats.std + 1e-15)
-        observation = np.clip(observation, self.clip_min, self.clip_max)
-
-        return observation
+        # TODO: make sure that a batch is given here
+        return self.running_observation_stats.normalize(observations)
 
     def get_filtered_observation_space(self, input_observation_space: ObservationSpace) -> ObservationSpace:
+        self.running_observation_stats.create_ops(shape=input_observation_space.shape,
+                                                  clip_values=(self.clip_min, self.clip_max))
         return input_observation_space

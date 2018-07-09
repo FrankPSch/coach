@@ -3,13 +3,13 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pytest
-from spaces import Discrete, Box, MultiSelect, ObservationSpace, AgentSelection, MeasurementsObservationSpace, Attention
+from spaces import DiscreteActionSpace, BoxActionSpace, MultiSelectActionSpace, ObservationSpace, AgentSelection, VectorObservationSpace, AttentionActionSpace
 import numpy as np
 
 
 @pytest.mark.unit_test
 def test_discrete():
-    action_space = Discrete(3, ["zero", "one", "two"])
+    action_space = DiscreteActionSpace(3, ["zero", "one", "two"])
     assert action_space.shape == 1
     for i in range(100):
         assert 3 > action_space.sample() >= 0
@@ -22,11 +22,11 @@ def test_discrete():
     assert action_space.get_description(1) == "one"
 
     # dict descriptions
-    action_space = Discrete(3, {1: "one", 2: "two", 0: "zero"})
+    action_space = DiscreteActionSpace(3, {1: "one", 2: "two", 0: "zero"})
     assert action_space.get_description(0) == "zero"
 
     # no descriptions
-    action_space = Discrete(3)
+    action_space = DiscreteActionSpace(3)
     assert action_space.get_description(0) == "0"
 
     # descriptions for invalid action
@@ -37,7 +37,7 @@ def test_discrete():
 @pytest.mark.unit_test
 def test_box():
     # simple action space
-    action_space = Box(4, -5, 5, ["a", "b", "c", "d"])
+    action_space = BoxActionSpace(4, -5, 5, ["a", "b", "c", "d"])
     for i in range(100):
         sample = action_space.sample()
         assert np.all(-5 <= sample) and np.all(sample <= 5)
@@ -49,7 +49,7 @@ def test_box():
     assert np.all(clipped_action == np.array([-5, 5, 2, 5]))
 
     # more complex high and low definition
-    action_space = Box(4, np.array([-5, -1, -0.5, 0]), np.array([1, 2, 4, 5]), ["a", "b", "c", "d"])
+    action_space = BoxActionSpace(4, np.array([-5, -1, -0.5, 0]), np.array([1, 2, 4, 5]), ["a", "b", "c", "d"])
     for i in range(100):
         sample = action_space.sample()
         assert np.all(np.array([-5, -1, -0.5, 0]) <= sample) and np.all(sample <= np.array([1, 2, 4, 5]))
@@ -61,7 +61,7 @@ def test_box():
     assert np.all(clipped_action == np.array([-5, 2, 2, 5]))
 
     # mixed high and low definition
-    action_space = Box(4, np.array([-5, -1, -0.5, 0]), 5, ["a", "b", "c", "d"])
+    action_space = BoxActionSpace(4, np.array([-5, -1, -0.5, 0]), 5, ["a", "b", "c", "d"])
     for i in range(100):
         sample = action_space.sample()
         assert np.all(np.array([-5, -1, -0.5, 0]) <= sample) and np.all(sample <= 5)
@@ -74,14 +74,14 @@ def test_box():
 
     # invalid bounds
     with pytest.raises(ValueError):
-        action_space = Box(4, np.array([-5, -1, -0.5, 0]), -1, ["a", "b", "c", "d"])
+        action_space = BoxActionSpace(4, np.array([-5, -1, -0.5, 0]), -1, ["a", "b", "c", "d"])
 
     # TODO: test descriptions
 
 
 @pytest.mark.unit_test
 def test_multiselect():
-    action_space = MultiSelect(4, 2, ["a", "b", "c", "d"])
+    action_space = MultiSelectActionSpace(4, 2, ["a", "b", "c", "d"])
     for i in range(100):
         action = action_space.sample()
         assert action.shape == (4,)
@@ -99,7 +99,7 @@ def test_multiselect():
 def test_attention():
     low = np.array([-1, -2, -3, -4])
     high = np.array([1, 2, 3, 4])
-    action_space = Attention(4, low=low, high=high)
+    action_space = AttentionActionSpace(4, low=low, high=high)
     for i in range(100):
         action = action_space.sample()
         assert len(action) == 2
@@ -155,10 +155,10 @@ def test_image_observation_space():
 @pytest.mark.unit_test
 def test_measurements_observation_space():
     # empty measurements space
-    measurements_space = MeasurementsObservationSpace(0)
+    measurements_space = VectorObservationSpace(0)
 
     # vector space
-    measurements_space = MeasurementsObservationSpace(3)
+    measurements_space = VectorObservationSpace(3, measurements_names=['a', 'b', 'c'])
 
 
 @pytest.mark.unit_test
@@ -168,7 +168,7 @@ def test_reward_space():
 
 
 # def test_discrete_to_linspace_action_space_map():
-#     box = Box(2, np.array([0, 0]), np.array([10, 10]))
+#     box = BoxActionSpace(2, np.array([0, 0]), np.array([10, 10]))
 #     linspace = BoxDiscretization(box, [5, 3])
 #     assert np.all(linspace.actions == np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]))
 #     assert np.all(linspace.target_actions ==
@@ -180,7 +180,7 @@ def test_reward_space():
 #
 #
 # def test_discrete_to_attention_action_space_map():
-#     attention = Attention(2, np.array([0, 0]), np.array([10, 10]))
+#     attention = AttentionActionSpace(2, np.array([0, 0]), np.array([10, 10]))
 #     linspace = AttentionDiscretization(attention, 2)
 #     assert np.all(linspace.actions == np.array([0, 1, 2, 3]))
 #     assert np.all(linspace.target_actions ==

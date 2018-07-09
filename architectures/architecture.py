@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-from configurations import AgentParameters
+from base_parameters import AgentParameters
 from spaces import SpacesDefinition
 
 

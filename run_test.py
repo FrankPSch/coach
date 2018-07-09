@@ -14,22 +14,24 @@
 # limitations under the License.
 #
 
-# -*- coding: utf-8 -*-
-import presets
-import numpy as np
-import pandas as pd
-from os import path
-import os
+import argparse
 import glob
+import os
 import shutil
+import signal
+import subprocess
 import sys
 import time
-from logger import screen
-from utils import list_all_classes_in_module, threaded_cmd_line_run, killed_processes
-import subprocess
-import signal
-import argparse
+from os import path
+from importlib import import_module
 
+import numpy as np
+import pandas as pd
+
+# -*- coding: utf-8 -*-
+# import presets
+from logger import screen
+from utils import list_all_classes_in_module
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -41,12 +43,6 @@ if __name__ == '__main__':
                         help="(string) Name of a preset(s) to ignore (comma separated, and as configured in presets.py)",
                         default=None,
                         type=str)
-    parser.add_argument('-itf', '--ignore_tensorflow',
-                        help="(flag) Don't test TensorFlow presets.",
-                        action='store_true')
-    parser.add_argument('-in', '--ignore_neon',
-                        help="(flag) Don't test neon presets.",
-                        action='store_true')
     parser.add_argument('-v', '--verbose',
                         help="(flag) display verbose logs in the event of an error",
                         action='store_true')
@@ -58,11 +54,12 @@ if __name__ == '__main__':
     if args.preset is not None:
         presets_lists = [args.preset]
     else:
-        presets_lists = list_all_classes_in_module(presets)
+        # presets_lists = list_all_classes_in_module(presets)
+        presets_lists = [f[:-3] for f in os.listdir('presets') if f[-3:] == '.py' and not f == '__init__.py']
     win_size = 10
     fail_count = 0
     test_count = 0
-    read_csv_tries = 70
+    read_csv_tries = 50
 
     # create a clean experiment directory
     test_name = '__test'
@@ -74,132 +71,136 @@ if __name__ == '__main__':
     else:
         presets_to_ignore = []
     for idx, preset_name in enumerate(presets_lists):
-        preset = eval('presets.{}()'.format(preset_name))
-        if preset.test and preset_name not in presets_to_ignore:
-            frameworks = []
-            if preset.agent.tensorflow_support and not args.ignore_tensorflow:  # TODO: fix this
-                frameworks.append('tensorflow')
-            if preset.agent.neon_support and not args.ignore_neon:     # TODO: fix this
-                frameworks.append('neon')
+        if preset_name not in presets_to_ignore:
+            try:
+                preset = import_module('presets.{}'.format(preset_name))
+            except:
+                screen.error("Failed to load perset <{}>".format(preset_name), crash=False)
+                continue
 
-            for framework in frameworks:
-                if args.stop_after_first_failure and fail_count > 0:
+            test_params = preset.graph_manager.test_params
+            if not test_params.test:
+                continue
+            if args.stop_after_first_failure and fail_count > 0:
+                break
+
+            test_count += 1
+
+            # run the experiment in a separate thread
+            screen.log_title("Running test {}".format(preset_name))
+            log_file_name = 'test_log_{preset_name}.txt'.format(preset_name=preset_name)
+
+            cmd = (
+                'CUDA_VISIBLE_DEVICES='' python3 coach.py '
+                '-p {preset_name} '
+                '-e {test_name} '
+                '-n {num_workers} '
+                '--seed 0 '
+                '-ew '
+                '{level} '
+                '&> {log_file_name} '
+            ).format(
+                preset_name=preset_name,
+                test_name=test_name,
+                num_workers=test_params.num_workers,
+                log_file_name=log_file_name,
+                level='-lvl ' + test_params.level if test_params.level else ''
+            )
+
+            p = subprocess.Popen(cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
+
+            # get the csv with the results
+            csv_path = None
+            csv_paths = []
+
+            if test_params.num_workers > 1:
+                # we have an evaluator
+                reward_str = 'Shaped Evaluation Reward'
+                filename_pattern = 'worker_{}*.csv'.format(test_params.num_workers)  # TODO: find a better way to extract csv
+
+
+            else:
+                reward_str = 'Training Reward'
+                filename_pattern = '*.csv'  # TODO: find a better way to extract csv
+
+            initialization_error = False
+            test_passed = False
+
+            tries_counter = 0
+            while not csv_paths:
+                csv_paths = glob.glob(path.join(test_path, '*', filename_pattern))
+                if tries_counter > read_csv_tries:
                     break
+                tries_counter += 1
+                time.sleep(1)
 
-                test_count += 1
+            if csv_paths:
+                csv_path = csv_paths[0]
 
-                # run the experiment in a separate thread
-                screen.log_title("Running test {} - {}".format(preset_name, framework))
-                log_file_name = 'test_log_{preset_name}_{framework}.txt'.format(
-                    preset_name=preset_name,
-                    framework=framework,
-                )
-                cmd = (
-                    'CUDA_VISIBLE_DEVICES='' python3 coach.py '
-                    '-p {preset_name} '
-                    '-f {framework} '
-                    '-e {test_name} '
-                    '-n {num_workers} '
-                    '--seed 0'
-                    '&> {log_file_name} '
-                ).format(
-                    preset_name=preset_name,
-                    framework=framework,
-                    test_name=test_name,
-                    num_workers=preset.test_num_workers,
-                    log_file_name=log_file_name,
-                )
-                p = subprocess.Popen(cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid)
+                # verify results
+                csv = None
+                time.sleep(1)
+                averaged_rewards = [0]
 
-                # get the csv with the results
-                csv_path = None
-                csv_paths = []
+                last_num_episodes = 0
+                while csv is None or csv['Episode #'].values[-1] < test_params.max_episodes_to_achieve_reward:
+                    try:
+                        csv = pd.read_csv(csv_path)
+                    except:
+                        # sometimes the csv is being written at the same time we are
+                        # trying to read it. no problem -> try again
+                        continue
 
-                if preset.test_num_workers > 1:
-                    # we have an evaluator
-                    reward_str = 'Evaluation Reward'
-                    filename_pattern = 'evaluator*.csv'
-                else:
-                    reward_str = 'Training Reward'
-                    filename_pattern = 'worker*.csv'
+                    if reward_str not in csv.keys():
+                        continue
 
-                initialization_error = False
-                test_passed = False
+                    rewards = csv[reward_str].values
+                    rewards = rewards[~np.isnan(rewards)]
 
-                tries_counter = 0
-                while not csv_paths:
-                    csv_paths = glob.glob(path.join(test_path, '*', filename_pattern))
-                    if tries_counter > read_csv_tries:
-                        break
-                    tries_counter += 1
-                    time.sleep(1)
-
-                if csv_paths:
-                    csv_path = csv_paths[0]
-
-                    # verify results
-                    csv = None
-                    time.sleep(1)
-                    averaged_rewards = [0]
-
-                    last_num_episodes = 0
-                    while csv is None or csv['Episode #'].values[-1] < preset.test_max_step_threshold:
-                        try:
-                            csv = pd.read_csv(csv_path)
-                        except:
-                            # sometimes the csv is being written at the same time we are
-                            # trying to read it. no problem -> try again
-                            continue
-
-                        if reward_str not in csv.keys():
-                            continue
-
-                        rewards = csv[reward_str].values
-                        rewards = rewards[~np.isnan(rewards)]
-
-                        if len(rewards) >= win_size:
-                            averaged_rewards = np.convolve(rewards, np.ones(win_size) / win_size, mode='valid')
-                        else:
-                            time.sleep(1)
-                            continue
-
-                        # print progress
-                        percentage = int((100*last_num_episodes)/preset.test_max_step_threshold)
-                        sys.stdout.write("\rReward: ({}/{})".format(round(averaged_rewards[-1], 1), preset.test_min_return_threshold))
-                        sys.stdout.write(' Episode: ({}/{})'.format(last_num_episodes, preset.test_max_step_threshold))
-                        sys.stdout.write(' {}%|{}{}|  '.format(percentage, '#'*int(percentage/10), ' '*(10-int(percentage/10))))
-                        sys.stdout.flush()
-
-                        if csv['Episode #'].shape[0] - last_num_episodes <= 0:
-                            continue
-
-                        last_num_episodes = csv['Episode #'].values[-1]
-
-                        # check if reward is enough
-                        if np.any(averaged_rewards > preset.test_min_return_threshold):
-                            test_passed = True
-                            break
-                        time.sleep(1)
-
-                # kill test and print result
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                if test_passed:
-                    screen.success("Passed successfully")
-                else:
-                    if csv_paths:
-                        screen.error("Failed due to insufficient reward", crash=False)
-                        screen.error("preset.test_max_step_threshold: {}".format(preset.test_max_step_threshold), crash=False)
-                        screen.error("preset.test_min_return_threshold: {}".format(preset.test_min_return_threshold), crash=False)
-                        screen.error("averaged_rewards: {}".format(averaged_rewards), crash=False)
-                        screen.error("episode number: {}".format(csv['Episode #'].values[-1]), crash=False)
+                    if len(rewards) >= win_size:
+                        averaged_rewards = np.convolve(rewards, np.ones(win_size) / win_size, mode='valid')
                     else:
-                        screen.error("csv file never found", crash=False)
-                        if args.verbose:
-                            screen.error("command exitcode: {}".format(p.returncode), crash=False)
-                            screen.error(open(log_file_name).read(), crash=False)
+                        time.sleep(1)
+                        continue
 
-                    fail_count += 1
-                shutil.rmtree(test_path)
+                    # print progress
+                    percentage = int((100*last_num_episodes)/test_params.max_episodes_to_achieve_reward)
+                    sys.stdout.write("\rReward: ({}/{})".format(round(averaged_rewards[-1], 1), test_params.min_reward_threshold))
+                    sys.stdout.write(' Episode: ({}/{})'.format(last_num_episodes, test_params.max_episodes_to_achieve_reward))
+                    sys.stdout.write(' {}%|{}{}|  '.format(percentage, '#'*int(percentage/10), ' '*(10-int(percentage/10))))
+                    sys.stdout.flush()
+
+                    if csv['Episode #'].shape[0] - last_num_episodes <= 0:
+                        continue
+
+                    last_num_episodes = csv['Episode #'].values[-1]
+
+                    # check if reward is enough
+
+                    if np.any(averaged_rewards > test_params.min_reward_threshold):
+                        test_passed = True
+                        break
+                    time.sleep(1)
+
+            # kill test and print result
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            if test_passed:
+                screen.success("Passed successfully")
+            else:
+                if csv_paths:
+                    screen.error("Failed due to insufficient reward", crash=False)
+                    screen.error("test_params.max_episodes_to_achieve_reward: {}".format(test_params.max_episodes_to_achieve_reward), crash=False)
+                    screen.error("test_params.min_reward_threshold: {}".format(test_params.min_reward_threshold), crash=False)
+                    screen.error("averaged_rewards: {}".format(averaged_rewards), crash=False)
+                    screen.error("episode number: {}".format(csv['Episode #'].values[-1]), crash=False)
+                else:
+                    screen.error("csv file never found", crash=False)
+                    if args.verbose:
+                        screen.error("command exitcode: {}".format(p.returncode), crash=False)
+                        screen.error(open(log_file_name).read(), crash=False)
+
+                fail_count += 1
+            shutil.rmtree(test_path)
 
 
     screen.separator()

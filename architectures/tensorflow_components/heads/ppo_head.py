@@ -14,26 +14,30 @@
 # limitations under the License.
 #
 
-import tensorflow as tf
-from configurations import AgentParameters
-from core_types import ActionProbabilities
-from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head
 import numpy as np
-from spaces import Box, Discrete
+import tensorflow as tf
+
+from architectures.tensorflow_components.heads.head import Head, HeadParameters, normalized_columns_initializer
+from base_parameters import AgentParameters
+from core_types import ActionProbabilities
+from spaces import BoxActionSpace, DiscreteActionSpace
+from spaces import SpacesDefinition
 from utils import eps
+
+
+class PPOHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='tanh', name: str='ppo_head_params'):
+        super().__init__(parameterized_class=PPOHead, activation_function=activation_function, name=name)
 
 
 class PPOHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='tanh'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'ppo_head'
-        self.num_actions = self.spaces.action.shape[-1]
         self.return_type = ActionProbabilities
-        if isinstance(self.spaces.action, Box):
-            self.output_scale = self.spaces.action.max_abs_range
 
+        # used in regular PPO
         self.use_kl_regularization = agent_parameters.algorithm.use_kl_regularization
         if self.use_kl_regularization:
             # kl coefficient and its corresponding assignment operation and placeholder
@@ -43,48 +47,23 @@ class PPOHead(Head):
             self.assign_kl_coefficient = tf.assign(self.kl_coefficient, self.kl_coefficient_ph)
             self.kl_cutoff = 2 * agent_parameters.algorithm.target_kl_divergence
             self.high_kl_penalty_coefficient = agent_parameters.algorithm.high_kl_penalty_coefficient
+
         self.clip_likelihood_ratio_using_epsilon = agent_parameters.algorithm.clip_likelihood_ratio_using_epsilon
         self.beta = agent_parameters.algorithm.beta_entropy
 
     def _build_module(self, input_layer):
-        if isinstance(self.spaces.action, Discrete):
-            self.actions = tf.placeholder(tf.int32, [None], name="actions")
-        elif isinstance(self.spaces.action, Box):
-            self.actions = tf.placeholder(tf.float32, [None, self.num_actions], name="actions")
+        if isinstance(self.spaces.action, DiscreteActionSpace):
+            self._build_discrete_net(input_layer, self.spaces.action)
+        elif isinstance(self.spaces.action, BoxActionSpace):
+            self._build_continuous_net(input_layer, self.spaces.action)
         else:
             raise ValueError("only discrete or continuous action spaces are supported for PPO")
-        self.old_policy_mean = tf.placeholder(tf.float32, [None, self.num_actions], "old_policy_mean")
-        self.old_policy_std = tf.placeholder(tf.float32, [None, self.num_actions], "old_policy_std")
 
-        # Policy Head
-        if isinstance(self.spaces.action, Discrete):
-            self.input = [self.actions, self.old_policy_mean]
-            policy_values = tf.layers.dense(input_layer, self.num_actions, name='policy_fc')
-            self.policy_mean = tf.nn.softmax(policy_values, name="policy")
-
-            # define the distributions for the policy and the old policy
-            self.policy_distribution = tf.contrib.distributions.Categorical(probs=self.policy_mean)
-            self.old_policy_distribution = tf.contrib.distributions.Categorical(probs=self.old_policy_mean)
-
-            self.output = self.policy_mean
-        elif isinstance(self.spaces.action, Box):
-            self.input = [self.actions, self.old_policy_mean, self.old_policy_std]
-            self.policy_mean = tf.layers.dense(input_layer, self.num_actions, name='policy_mean')
-            self.policy_logstd = tf.Variable(np.zeros((1, self.num_actions)), dtype='float32')
-            self.policy_std = tf.tile(tf.exp(self.policy_logstd), [tf.shape(input_layer)[0], 1], name='policy_std')
-
-            # define the distributions for the policy and the old policy
-            self.policy_distribution = tf.distributions.Normal(self.policy_mean,
-                                                                                       self.policy_std + eps)
-            self.old_policy_distribution = tf.distributions.Normal(self.old_policy_mean,
-                                                                                           self.old_policy_std + eps)
-
-            self.output = [self.policy_mean, self.policy_std]
-
-        self.action_probs_wrt_policy = tf.exp(self.policy_distribution.log_prob(self.actions))
-        self.action_probs_wrt_old_policy = tf.exp(self.old_policy_distribution.log_prob(self.actions))
+        self.action_probs_wrt_policy = self.policy_distribution.log_prob(self.actions)
+        self.action_probs_wrt_old_policy = self.old_policy_distribution.log_prob(self.actions)
         self.entropy = tf.reduce_mean(self.policy_distribution.entropy())
 
+        # Used by regular PPO only
         # add kl divergence regularization  # TODO: the kl divergence does not work in TF 1.4.1. either switch to explicit calculation or switch TF
         self.kl_divergence = tf.reduce_mean(tf.distributions.kl_divergence(self.old_policy_distribution, self.policy_distribution))
         # self.kl_divergence = tf.reduce_mean(tf.log(self.old_policy_std / self.policy_std) +
@@ -101,10 +80,12 @@ class PPOHead(Head):
         self.advantages = tf.placeholder(tf.float32, [None], name="advantages")
         self.target = self.advantages
         # action_probs_wrt_old_policy != 0 because it is e^...
-        self.likelihood_ratio = self.action_probs_wrt_policy / (self.action_probs_wrt_old_policy + eps)
+        self.likelihood_ratio = tf.exp(self.action_probs_wrt_policy - self.action_probs_wrt_old_policy)
         if self.clip_likelihood_ratio_using_epsilon is not None:
-            max_value = 1 + self.clip_likelihood_ratio_using_epsilon
-            min_value = 1 - self.clip_likelihood_ratio_using_epsilon
+            self.clip_param_rescaler = tf.placeholder(tf.float32, ())
+            self.input.append(self.clip_param_rescaler)
+            max_value = 1 + self.clip_likelihood_ratio_using_epsilon * self.clip_param_rescaler
+            min_value = 1 - self.clip_likelihood_ratio_using_epsilon * self.clip_param_rescaler
             self.clipped_likelihood_ratio = tf.clip_by_value(self.likelihood_ratio, min_value, max_value)
             self.scaled_advantages = tf.minimum(self.likelihood_ratio * self.advantages,
                                                 self.clipped_likelihood_ratio * self.advantages)
@@ -121,3 +102,45 @@ class PPOHead(Head):
 
         self.loss = self.surrogate_loss
         tf.losses.add_loss(self.loss)
+
+    def _build_discrete_net(self, input_layer, action_space):
+        num_actions = len(action_space.actions)
+        self.actions = tf.placeholder(tf.int32, [None], name="actions")
+
+        self.old_policy_mean = tf.placeholder(tf.float32, [None, num_actions], "old_policy_mean")
+        self.old_policy_std = tf.placeholder(tf.float32, [None, num_actions], "old_policy_std")
+
+        # Policy Head
+        self.input = [self.actions, self.old_policy_mean]
+        policy_values = tf.layers.dense(input_layer, num_actions, name='policy_fc')
+        self.policy_mean = tf.nn.softmax(policy_values, name="policy")
+
+        # define the distributions for the policy and the old policy
+        self.policy_distribution = tf.contrib.distributions.Categorical(probs=self.policy_mean)
+        self.old_policy_distribution = tf.contrib.distributions.Categorical(probs=self.old_policy_mean)
+
+        self.output = self.policy_mean
+
+    def _build_continuous_net(self, input_layer, action_space):
+        num_actions = action_space.shape[0]
+        self.actions = tf.placeholder(tf.float32, [None, num_actions], name="actions")
+
+        self.old_policy_mean = tf.placeholder(tf.float32, [None, num_actions], "old_policy_mean")
+        self.old_policy_std = tf.placeholder(tf.float32, [None, num_actions], "old_policy_std")
+
+        self.input = [self.actions, self.old_policy_mean, self.old_policy_std]
+        self.policy_mean = tf.layers.dense(input_layer, num_actions, name='policy_mean',
+                                           kernel_initializer=normalized_columns_initializer(0.01))
+        if self.is_local:
+            self.policy_logstd = tf.Variable(np.zeros((1, num_actions)), dtype='float32',
+                                            collections = [tf.GraphKeys.LOCAL_VARIABLES])
+        else:
+            self.policy_logstd = tf.Variable(np.zeros((1, num_actions)), dtype='float32')
+
+        self.policy_std = tf.tile(tf.exp(self.policy_logstd), [tf.shape(input_layer)[0], 1], name='policy_std')
+
+        # define the distributions for the policy and the old policy
+        self.policy_distribution = tf.contrib.distributions.MultivariateNormalDiag(self.policy_mean, self.policy_std + eps)
+        self.old_policy_distribution = tf.contrib.distributions.MultivariateNormalDiag(self.old_policy_mean, self.old_policy_std + eps)
+
+        self.output = [self.policy_mean, self.policy_std]

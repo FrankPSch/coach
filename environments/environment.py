@@ -14,17 +14,21 @@
 # limitations under the License.
 #
 
-from renderer import Renderer
 import operator
 import time
-from typing import Union, List, Tuple, Dict, Any
-from core_types import GoalType, ActionType, ObservationType, EnvResponse, RunPhase
-from environments.environment_interface import EnvironmentInterface
-import logger
-from configurations import VisualizationParameters
-from spaces import ActionSpace, ObservationSpace, Discrete, MeasurementsObservationSpace, RewardSpace
-from configurations import Parameters
+from collections import OrderedDict
+from typing import Union, List, Tuple, Dict
+
 import numpy as np
+
+import logger
+from logger import screen
+from base_parameters import Parameters
+from base_parameters import VisualizationParameters
+from core_types import GoalType, ActionType, EnvResponse, RunPhase
+from environments.environment_interface import EnvironmentInterface
+from renderer import Renderer
+from spaces import ActionSpace, ObservationSpace, DiscreteActionSpace, RewardSpace, StateSpace
 from utils import squeeze_list, force_list
 
 
@@ -52,10 +56,13 @@ class SingleLevelSelection(LevelSelection):
             self.levels = {levels: levels}
 
     def __str__(self):
-        super().__str__()
+        if self.selected_level is None:
+            logger.screen.error("No level has been selected. Please select a level using the -lvl command line flag, "
+                                "or change the level in the preset. \nThe available levels are: \n{}"
+                                .format(', '.join(self.levels.keys())), crash=True)
         if self.selected_level not in self.levels.keys():
             logger.screen.error("The selected level ({}) is not part of the available levels ({})"
-                                .format(self.selected_level, self.levels.keys()), crash=True)
+                                .format(self.selected_level, ', '.join(self.levels.keys())), crash=True)
         return self.levels[self.selected_level]
 
 
@@ -128,6 +135,8 @@ class Environment(EnvironmentInterface):
         self._last_env_response = None
         self.last_action = 0
         self.episode_idx = 0
+        self.total_steps_counter = 0
+        self.current_episode_steps_counter = 0
         self.last_episode_time = time.time()
         self.key_to_action = {}
         self.last_episode_images = []
@@ -174,7 +183,7 @@ class Environment(EnvironmentInterface):
         self._action_space = val
 
     @property
-    def state_space(self) -> Union[List[ObservationSpace], ObservationSpace]:
+    def state_space(self) -> Union[List[StateSpace], StateSpace]:
         """
         Get the state space of the environment
         :return: the observation space
@@ -182,7 +191,7 @@ class Environment(EnvironmentInterface):
         return self._state_space
 
     @state_space.setter
-    def state_space(self, val: Union[List[ObservationSpace], ObservationSpace]):
+    def state_space(self, val: Union[List[StateSpace], StateSpace]):
         """
         Set the state space of the environment
         :return: None
@@ -264,8 +273,14 @@ class Environment(EnvironmentInterface):
         if self.visualization_parameters.add_rendered_image_to_env_response:
             current_rendered_image = self.get_rendered_image()
 
+        self.current_episode_steps_counter += 1
+        if self.phase != RunPhase.UNDEFINED:
+            self.total_steps_counter += 1
+
+        # act
         self._take_action(action)
 
+        # observe
         self._update_state()
 
         if self.is_rendered:
@@ -279,14 +294,15 @@ class Environment(EnvironmentInterface):
         self.last_env_response = \
             EnvResponse(
                 reward=self.reward,
-                new_state=self.state,
+                next_state=self.state,
                 goal=self.goal,
                 game_over=self.done,
                 info=self.info
             )
 
         # store observations for video / gif dumping
-        if self.should_dump_video_of_the_current_episode(episode_terminated=False):
+        if self.should_dump_video_of_the_current_episode(episode_terminated=False) and \
+            (self.visualization_parameters.dump_mp4 or self.visualization_parameters.dump_gifs):
             self.last_episode_images.append(self.get_rendered_image())
 
         return self.last_env_response
@@ -300,21 +316,26 @@ class Environment(EnvironmentInterface):
         else:
             self.renderer.render_image(self.get_rendered_image())
 
-    def reset(self, force_environment_reset=False) -> EnvResponse:
+    def reset_internal_state(self, force_environment_reset=False) -> EnvResponse:
         """
         Reset the environment and all the variable of the wrapper
         :param force_environment_reset: forces environment reset even when the game did not end
         :return: A dictionary containing the observation, reward, done flag, action and measurements
         """
+
         if self.reward_success_threshold and self.total_reward_in_current_episode >= self.reward_success_threshold:
             self.success_counter += 1
         self.dump_video_of_last_episode()
         self._restart_environment_episode(force_environment_reset)
         self.last_episode_time = time.time()
+
+        if self.current_episode_steps_counter > 0 and self.phase != RunPhase.UNDEFINED:
+            self.episode_idx += 1
+
         self.done = False
-        self.episode_idx += 1
-        self.reward = 0.0
+        self.total_reward_in_current_episode = self.reward = 0.0
         self.last_action = 0
+        self.current_episode_steps_counter = 0
         self.last_episode_images = []
         self._update_state()
 
@@ -322,12 +343,10 @@ class Environment(EnvironmentInterface):
         if self.is_rendered:
             self.render()
 
-        self.total_reward_in_current_episode = self.reward
-
         self.last_env_response = \
             EnvResponse(
                 reward=self.reward,
-                new_state=self.state,
+                next_state=self.state,
                 goal=self.goal,
                 game_over=self.done,
                 info=self.info
@@ -353,7 +372,7 @@ class Environment(EnvironmentInterface):
                 if key != ():
                     key_names = [self.renderer.get_key_names([k])[0] for k in key]
                     available_keys.append((self.action_space.descriptions[idx], ' + '.join(key_names)))
-        elif type(self.action_space) == Discrete:
+        elif type(self.action_space) == DiscreteActionSpace:
             for action in range(self.action_space.shape):
                 available_keys.append(("Action {}".format(action + 1), action + 1))
         return available_keys
@@ -385,13 +404,21 @@ class Environment(EnvironmentInterface):
         # TODO: maybe move to a wrapper?
         if self.visualization_parameters.video_dump_methods and self.last_episode_images != []:
             if self.should_dump_video_of_the_current_episode(episode_terminated=True):
-                frame_skipping = int(5 / self.frame_skip)
+                frame_skipping = max(1, int(5 / self.frame_skip))
                 file_name = 'episode-{}_score-{}'.format(self.episode_idx, self.total_reward_in_current_episode)
                 fps = 10
                 if self.visualization_parameters.dump_gifs:
                     logger.create_gif(self.last_episode_images[::frame_skipping], name=file_name, fps=fps)
                 if self.visualization_parameters.dump_mp4:
                     logger.create_mp4(self.last_episode_images[::frame_skipping], name=file_name, fps=fps)
+
+    def log_to_screen(self):
+        # log to screen
+        log = OrderedDict()
+        log["Episode"] = self.episode_idx
+        log["Total reward"] = np.round(self.total_reward_in_current_episode, 2)
+        log["Steps"] = self.total_steps_counter
+        screen.log_dict(log, prefix=self.phase.value)
 
     # The following functions define the interaction with the environment.
     # Any new environment that inherits the Environment class should use these signatures.
@@ -434,7 +461,7 @@ class Environment(EnvironmentInterface):
         This can be different from the observation. For example, mujoco's observation is a measurements vector.
         :return: numpy array containing the image that will be rendered to the screen
         """
-        return self.state['observation']
+        return np.transpose(self.state['observation'], [1, 2, 0])
 
 
 """
@@ -448,6 +475,17 @@ class VideoDumpMethod(object):
     """
     def should_dump(self, episode_terminated=False, **kwargs):
         raise NotImplementedError("")
+
+
+class AlwaysDumpMethod(VideoDumpMethod):
+    """
+    Dump video for every episode
+    """
+    def __init__(self):
+        super().__init__()
+
+    def should_dump(self, episode_terminated=False, **kwargs):
+        return True
 
 
 class MaxDumpMethod(VideoDumpMethod):

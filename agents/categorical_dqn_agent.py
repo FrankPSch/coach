@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
 import numpy as np
-from agents.dqn_agent import DQNAgentParameters, DQNNetworkParameters, DQNAlgorithmParameters
-from configurations import OutputTypes, AgentParameters
+
+from agents.dqn_agent import DQNNetworkParameters, DQNAlgorithmParameters
+from agents.value_optimization_agent import ValueOptimizationAgent
+from architectures.tensorflow_components.heads.categorical_q_head import CategoricalQHeadParameters
+from base_parameters import AgentParameters
 from core_types import StateType
 from exploration_policies.e_greedy import EGreedyParameters
 from memories.experience_replay import ExperienceReplayParameters
@@ -28,8 +31,7 @@ from schedules import LinearSchedule
 class CategoricalDQNNetworkParameters(DQNNetworkParameters):
     def __init__(self):
         super().__init__()
-        self.output_types = [OutputTypes.CategoricalQ]
-        self.neon_support = False
+        self.heads_parameters = [CategoricalQHeadParameters()]
 
 
 class CategoricalDQNAlgorithmParameters(DQNAlgorithmParameters):
@@ -74,13 +76,14 @@ class CategoricalDQNAgent(ValueOptimizationAgent):
         return self.distribution_prediction_to_q_values(prediction)
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # for the action we actually took, the error is calculated by the atoms distribution
         # for all other actions, the error is 0
-        distributed_q_st_plus_1 = self.networks['main'].target_network.predict(next_states)
-        # initialize with the current prediction so that we will
-        TD_targets = self.networks['main'].online_network.predict(current_states)
+        distributed_q_st_plus_1, TD_targets = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.next_states(network_keys)),
+            (self.networks['main'].online_network, batch.states(network_keys))
+        ])
 
         # only update the action that we have actually done in this transition
         target_actions = np.argmax(self.distribution_prediction_to_q_values(distributed_q_st_plus_1), axis=1)
@@ -88,7 +91,8 @@ class CategoricalDQNAgent(ValueOptimizationAgent):
 
         batches = np.arange(self.ap.network_wrappers['main'].batch_size)
         for j in range(self.z_values.size):
-            tzj = np.fmax(np.fmin(rewards + (1.0 - game_overs) * self.ap.algorithm.discount * self.z_values[j],
+            tzj = np.fmax(np.fmin(batch.rewards() +
+                                  (1.0 - batch.game_overs()) * self.ap.algorithm.discount * self.z_values[j],
                                   self.z_values[self.z_values.size - 1]),
                           self.z_values[0])
             bj = (tzj - self.z_values[0])/(self.z_values[1] - self.z_values[0])
@@ -97,9 +101,9 @@ class CategoricalDQNAgent(ValueOptimizationAgent):
             m[batches, l] = m[batches, l] + (distributed_q_st_plus_1[batches, target_actions, j] * (u - bj))
             m[batches, u] = m[batches, u] + (distributed_q_st_plus_1[batches, target_actions, j] * (bj - l))
         # total_loss = cross entropy between actual result above and predicted result for the given action
-        TD_targets[batches, actions] = m
+        TD_targets[batches, batch.actions()] = m
 
-        result = self.networks['main'].train_and_sync_networks(current_states, TD_targets)
+        result = self.networks['main'].train_and_sync_networks(batch.states(network_keys), TD_targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads

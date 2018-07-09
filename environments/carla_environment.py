@@ -20,19 +20,17 @@ except ImportError:
 import logging
 import subprocess
 from environments.environment import Environment, EnvironmentParameters, LevelSelection
-from spaces import ObservationSpace, Box, ImageObservationSpace, StateSpace, \
-    MeasurementsObservationSpace
+from spaces import BoxActionSpace, ImageObservationSpace, StateSpace, \
+    VectorObservationSpace
 from utils import get_open_port, force_list
 from enum import Enum
 import os
 import signal
-import logger
-from typing import Dict, Any, List, Union
-from configurations import VisualizationParameters
+from typing import List, Union
+from base_parameters import VisualizationParameters
 from filters.filter import InputFilter, NoOutputFilter
 from filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
 from filters.observation.observation_stacking_filter import ObservationStackingFilter
-from collections import OrderedDict
 import numpy as np
 
 
@@ -129,7 +127,7 @@ class CarlaEnvironment(Environment):
 
         # state space
         self.state_space = StateSpace({
-            "measurements": MeasurementsObservationSpace(1)
+            "measurements": VectorObservationSpace(4, measurements_names=["forward_speed", "x", "y", "z"])
         })
         for camera in self.cameras:
             self.state_space[camera.value] = ImageObservationSpace(
@@ -172,7 +170,7 @@ class CarlaEnvironment(Environment):
         self.iterator_start_positions = 0
 
         # action space
-        self.action_space = Box(shape=2, low=np.array([-1, -1]), high=np.array([1, 1]))
+        self.action_space = BoxActionSpace(shape=2, low=np.array([-1, -1]), high=np.array([1, 1]))
 
         # human control
         if self.human_control:
@@ -208,7 +206,7 @@ class CarlaEnvironment(Environment):
         self.autopilot = None
 
         # env initialization
-        self.reset(True)
+        self.reset_internal_state(True)
 
         # render
         if self.is_rendered:
@@ -289,9 +287,9 @@ class CarlaEnvironment(Environment):
         for camera in self.cameras:
             self.state[camera.value] = sensor_data[camera.value].data
 
-        self.location = (measurements.player_measurements.transform.location.x,
+        self.location = [measurements.player_measurements.transform.location.x,
                          measurements.player_measurements.transform.location.y,
-                         measurements.player_measurements.transform.location.z)
+                         measurements.player_measurements.transform.location.z]
 
         is_collision = measurements.player_measurements.collision_vehicles != 0 \
                        or measurements.player_measurements.collision_pedestrians != 0 \
@@ -307,7 +305,7 @@ class CarlaEnvironment(Environment):
                       - np.abs(self.control.steer) * 10
 
         # update measurements
-        self.measurements = [measurements.player_measurements.forward_speed]
+        self.measurements = [measurements.player_measurements.forward_speed] + self.location
         self.autopilot = measurements.player_measurements.autopilot_control
 
         # action_p = ['%.2f' % member for member in [self.control.throttle, self.control.steer]]

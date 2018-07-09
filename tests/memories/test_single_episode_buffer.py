@@ -12,7 +12,7 @@ from memories.single_episode_buffer import SingleEpisodeBuffer
 
 @pytest.fixture()
 def buffer():
-    return SingleEpisodeBuffer(0.99, False, -1)
+    return SingleEpisodeBuffer()
 
 
 @pytest.mark.unit_test

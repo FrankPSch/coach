@@ -15,38 +15,41 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
+
+from architectures.tensorflow_components.heads.head import Head, HeadParameters
+from base_parameters import AgentParameters
 from core_types import Measurements
 from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head
+
+
+class MeasurementsPredictionHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='measurements_prediction_head_params'):
+        super().__init__(parameterized_class=MeasurementsPredictionHead,
+                         activation_function=activation_function, name=name)
 
 
 class MeasurementsPredictionHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'future_measurements_head'
-        self.num_actions = self.spaces.action.shape
-        self.num_measurements = self.spaces.measurements.shape
+        self.num_actions = len(self.spaces.action.actions)
+        self.num_measurements = self.spaces.state['measurements'].shape[0]
         self.num_prediction_steps = agent_parameters.algorithm.num_predicted_steps_ahead
         self.multi_step_measurements_size = self.num_measurements * self.num_prediction_steps
         self.return_type = Measurements
-        if agent_parameters.network_wrappers[self.network_name].replace_mse_with_huber_loss:
-            self.loss_type = tf.losses.huber_loss
-        else:
-            self.loss_type = tf.losses.mean_squared_error
 
     def _build_module(self, input_layer):
         # This is almost exactly the same as Dueling Network but we predict the future measurements for each action
         # actions expectation tower (expectation stream) - E
         with tf.variable_scope("expectation_stream"):
-            expectation_stream = tf.layers.dense(input_layer, 256, activation=tf.nn.elu, name='fc1')
+            expectation_stream = tf.layers.dense(input_layer, 256, activation=self.activation_function, name='fc1')
             expectation_stream = tf.layers.dense(expectation_stream, self.multi_step_measurements_size, name='output')
             expectation_stream = tf.expand_dims(expectation_stream, axis=1)
 
         # action fine differences tower (action stream) - A
         with tf.variable_scope("action_stream"):
-            action_stream = tf.layers.dense(input_layer, 256, activation=tf.nn.elu, name='fc1')
+            action_stream = tf.layers.dense(input_layer, 256, activation=self.activation_function, name='fc1')
             action_stream = tf.layers.dense(action_stream, self.num_actions * self.multi_step_measurements_size,
                                             name='output')
             action_stream = tf.reshape(action_stream,
@@ -55,3 +58,8 @@ class MeasurementsPredictionHead(Head):
 
         # merge to future measurements predictions
         self.output = tf.add(expectation_stream, action_stream, name='output')
+        self.target = tf.placeholder(tf.float32, [None, self.num_actions, self.multi_step_measurements_size],
+                                     name="targets")
+        targets_nonan = tf.where(tf.is_nan(self.target), self.output, self.target)
+        self.loss = tf.reduce_sum(tf.reduce_mean(tf.square(targets_nonan - self.output), reduction_indices=0))
+        tf.losses.add_loss(self.loss_weight[0] * self.loss)

@@ -14,14 +14,79 @@
 # limitations under the License.
 #
 
-from architectures.architecture import Architecture
-import tensorflow as tf
-from utils import force_list, squeeze_list
-from configurations import MiddlewareTypes, AgentParameters
 import time
-from spaces import SpacesDefinition
-from block_factories.block_factory import DistributedTaskParameters
+from typing import List
+
 import numpy as np
+import tensorflow as tf
+
+from architectures.architecture import Architecture
+from core_types import GradientClippingMethod
+from base_parameters import AgentParameters, DistributedTaskParameters
+from spaces import SpacesDefinition
+from utils import force_list, squeeze_list
+
+
+def batchnorm_activation_dropout(input_layer, batchnorm, activation_function, dropout, dropout_rate, layer_idx):
+    layers = [input_layer]
+
+    # batchnorm
+    if batchnorm:
+        layers.append(
+            tf.layers.batch_normalization(layers[-1], name="batchnorm{}".format(layer_idx))
+        )
+
+    # activation
+    if activation_function:
+        layers.append(
+            activation_function(layers[-1], name="activation{}".format(layer_idx))
+        )
+
+    # dropout
+    if dropout:
+        layers.append(
+            tf.layers.dropout(layers[-1], dropout_rate, name="dropout{}".format(layer_idx))
+        )
+
+    # remove the input layer from the layers list
+    del layers[0]
+
+    return layers
+
+
+class Conv2d(object):
+    def __init__(self, params: List):
+        """
+        :param params: list of [num_filters, kernel_size, strides]
+        """
+        self.params = params
+
+    def __call__(self, input_layer, name: str):
+        """
+        returns a tensorflow conv2d layer
+        :param input_layer: previous layer
+        :param name: layer name
+        :return: conv2d layer
+        """
+        return tf.layers.conv2d(input_layer, filters=self.params[0], kernel_size=self.params[1], strides=self.params[2],
+                                data_format='channels_last', name=name)
+
+
+class Dense(object):
+    def __init__(self, params: List):
+        """
+        :param params: list of [num_output_neurons]
+        """
+        self.params = params
+
+    def __call__(self, input_layer, name: str):
+        """
+        returns a tensorflow dense layer
+        :param input_layer: previous layer
+        :param name: layer name
+        :return: dense layer
+        """
+        return tf.layers.dense(input_layer, self.params[0], name=name)
 
 
 def variable_summaries(var):
@@ -63,8 +128,9 @@ class TensorFlowArchitecture(Architecture):
         :param network_is_trainable: is the network trainable (we can apply gradients on it)
         """
         super().__init__(agent_parameters, spaces, name)
-        self.middleware_embedder = None
+        self.middleware = None
         self.network_is_local = network_is_local
+        self.global_network = global_network
         if not self.network_parameters.tensorflow_support:
             raise ValueError('TensorFlow is not supported for this agent')
         self.sess = None
@@ -76,11 +142,17 @@ class TensorFlowArchitecture(Architecture):
         self.total_loss = None
         self.trainable_weights = []
         self.weights_placeholders = []
+        self.shared_accumulated_gradients = []
         self.curr_rnn_c_in = None
         self.curr_rnn_h_in = None
         self.gradients_wrt_inputs = []
         self.train_writer = None
+        self.accumulated_gradients = None
         self.network_is_trainable = network_is_trainable
+
+        self.is_chief = self.ap.task_parameters.task_index == 0
+        self.network_is_global = not self.network_is_local and global_network is None
+        self.distributed_training = self.network_is_global or self.network_is_local and global_network is not None
 
         self.optimizer_type = self.network_parameters.optimizer_type
         if self.ap.task_parameters.seed is not None:
@@ -93,51 +165,25 @@ class TensorFlowArchitecture(Architecture):
             self.get_model()
 
             # model weights
-            # TODO: why are all the variables going to trainable_variables collection?
             self.weights = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.full_name)
 
-            # locks for synchronous training
-            # TODO: bring back this if
-            # if isinstance(self.ap.task_parameters, DistributedTaskParameters) and not self.network_parameters.async_training \
-            #         and not self.network_is_local:
-            if not self.network_is_local:
-                self.lock_counter = tf.get_variable("lock_counter", [], tf.int32,
-                                                    initializer=tf.constant_initializer(0, dtype=tf.int32),
-                                                    trainable=False)
-                self.lock = self.lock_counter.assign_add(1, use_locking=True)
-                self.lock_init = self.lock_counter.assign(0)
-
-                self.release_counter = tf.get_variable("release_counter", [], tf.int32,
-                                                       initializer=tf.constant_initializer(0, dtype=tf.int32),
-                                                       trainable=False)
-                self.release = self.release_counter.assign_add(1, use_locking=True)
-                self.release_init = self.release_counter.assign(0)
-
-            # local network does the optimization so we need to create all the ops we are going to use to optimize
+            # create the placeholder for the assigning gradients and some tensorboard summaries for the weights
             for idx, var in enumerate(self.weights):
                 placeholder = tf.placeholder(tf.float32, shape=var.get_shape(), name=str(idx) + '_holder')
                 self.weights_placeholders.append(placeholder)
                 if self.ap.visualization.tensorboard:
                     variable_summaries(var)
 
+            # create op for assigning a list of weights to the network weights
             self.update_weights_from_list = [weights.assign(holder) for holder, weights in
                                              zip(self.weights_placeholders, self.weights)]
 
-            # gradients ops
-            self.tensor_gradients = tf.gradients(self.total_loss, self.weights)
-            self.gradients_norm = tf.global_norm(self.tensor_gradients)
-            if self.network_parameters.clip_gradients is not None and self.network_parameters.clip_gradients != 0:
-                self.clipped_grads, self.grad_norms = tf.clip_by_global_norm(self.tensor_gradients,
-                                                                             self.network_parameters.clip_gradients)
+            # locks for synchronous training
+            if self.network_is_global:
+                self._create_locks_for_synchronous_training()
 
-            # gradients of the outputs w.r.t. the inputs
-            # at the moment, this is only used by ddpg
-            self.gradients_wrt_inputs = [{name: tf.gradients(output, input_ph) for name, input_ph in
-                                         self.inputs.items()} for output in self.outputs]
-            self.gradients_weights_ph = [tf.placeholder('float32', self.outputs[i].shape, 'output_gradient_weights')
-                                         for i in range(len(self.outputs))]
-            self.weighted_gradients = [tf.gradients(self.outputs[i], self.weights, self.gradients_weights_ph[i])
-                                       for i in range(len(self.outputs))]
+            # gradients ops
+            self._create_gradient_ops()
 
             # L2 regularization
             if self.network_parameters.l2_regularization != 0:
@@ -147,15 +193,13 @@ class TensorFlowArchitecture(Architecture):
 
             self.inc_step = self.global_step.assign_add(1)
 
-            # defining the optimization process (for LBFGS we have less control over the optimizer)
-            if self.optimizer_type != 'LBFGS' and self.network_is_trainable:
-                # no global network, this is a plain simple centralized training
-                self.update_weights_from_batch_gradients = self.optimizer.apply_gradients(
-                    zip(self.weights_placeholders, self.weights), global_step=self.global_step)
+            # reset LSTM hidden cells
+            self.reset_internal_memory()
 
-            current_scope_summaries = tf.get_collection(tf.GraphKeys.SUMMARIES,
-                                                        scope=tf.contrib.framework.get_name_scope())
-            self.merged = tf.summary.merge(current_scope_summaries)
+            if self.ap.visualization.tensorboard:
+                current_scope_summaries = tf.get_collection(tf.GraphKeys.SUMMARIES,
+                                                            scope=tf.contrib.framework.get_name_scope())
+                self.merged = tf.summary.merge(current_scope_summaries)
 
             # initialize or restore model
             self.init_op = tf.group(
@@ -163,24 +207,148 @@ class TensorFlowArchitecture(Architecture):
                 tf.local_variables_initializer()
             )
 
-        self.accumulated_gradients = None
+            # set the fetches for training
+            self._set_initial_fetch_list()
+
+    def _set_initial_fetch_list(self):
+        """
+        Create an initial list of tensors to fetch in each training iteration
+        :return: None
+        """
+        self.train_fetches = [self.gradients_norm]
+        if self.network_parameters.clip_gradients:
+            self.train_fetches.append(self.clipped_grads)
+        else:
+            self.train_fetches.append(self.tensor_gradients)
+        self.train_fetches += [self.total_loss, self.losses]
+        if self.middleware.__class__.__name__ == 'LSTMMiddleware':
+            self.train_fetches.append(self.middleware.state_out)
+        self.additional_fetches_start_idx = len(self.train_fetches)
+
+    def _create_locks_for_synchronous_training(self):
+        """
+        Create locks for synchronizing the different workers during training
+        :return: None
+        """
+        self.lock_counter = tf.get_variable("lock_counter", [], tf.int32,
+                                            initializer=tf.constant_initializer(0, dtype=tf.int32),
+                                            trainable=False)
+        self.lock = self.lock_counter.assign_add(1, use_locking=True)
+        self.lock_init = self.lock_counter.assign(0)
+
+        self.release_counter = tf.get_variable("release_counter", [], tf.int32,
+                                               initializer=tf.constant_initializer(0, dtype=tf.int32),
+                                               trainable=False)
+        self.release = self.release_counter.assign_add(1, use_locking=True)
+        self.release_decrement = self.release_counter.assign_add(-1, use_locking=True)
+        self.release_init = self.release_counter.assign(0)
+
+    def _create_gradient_ops(self):
+        """
+        Create all the tensorflow operations for calculating gradients, processing the gradients and applying them
+        :return: None
+        """
+
+        self.tensor_gradients = tf.gradients(self.total_loss, self.weights)
+        self.gradients_norm = tf.global_norm(self.tensor_gradients)
+
+        # gradient clipping
+        if self.network_parameters.clip_gradients is not None and self.network_parameters.clip_gradients != 0:
+            self._create_gradient_clipping_ops()
+
+        # when using a shared optimizer, we create accumulators to store gradients from all the workers before
+        # applying them
+        if self.distributed_training:
+            self._create_gradient_accumulators()
+
+        # gradients of the outputs w.r.t. the inputs
+        # at the moment, this is only used by ddpg
+        self.gradients_wrt_inputs = [{name: tf.gradients(output, input_ph) for name, input_ph in
+                                      self.inputs.items()} for output in self.outputs]
+        self.gradients_weights_ph = [tf.placeholder('float32', self.outputs[i].shape, 'output_gradient_weights')
+                                     for i in range(len(self.outputs))]
+        self.weighted_gradients = []
+        for i in range(len(self.outputs)):
+            unnormalized_gradients = tf.gradients(self.outputs[i], self.weights, self.gradients_weights_ph[i])
+            # unnormalized gradients seems to be better at the time. TODO: validate this accross more environments
+            # self.weighted_gradients.append(list(map(lambda x: tf.div(x, self.network_parameters.batch_size),
+            #                                         unnormalized_gradients)))
+            self.weighted_gradients.append(unnormalized_gradients)
+
+        # defining the optimization process (for LBFGS we have less control over the optimizer)
+        if self.optimizer_type != 'LBFGS' and self.network_is_trainable:
+            self._create_gradient_applying_ops()
+
+    def _create_gradient_accumulators(self):
+        if self.network_is_global:
+            self.shared_accumulated_gradients = [tf.Variable(initial_value=tf.zeros_like(var)) for var in self.weights]
+            self.accumulate_shared_gradients = [var.assign_add(holder, use_locking=True) for holder, var in
+                                                zip(self.weights_placeholders, self.shared_accumulated_gradients)]
+            self.init_shared_accumulated_gradients = [var.assign(tf.zeros_like(var)) for var in
+                                                      self.shared_accumulated_gradients]
+        elif self.network_is_local:
+            self.accumulate_shared_gradients = self.global_network.accumulate_shared_gradients
+            self.init_shared_accumulated_gradients = self.global_network.init_shared_accumulated_gradients
+
+    def _create_gradient_clipping_ops(self):
+        """
+        Create tensorflow ops for clipping the gradients according to the given GradientClippingMethod
+        :return: None
+        """
+        if self.network_parameters.gradients_clipping_method == GradientClippingMethod.ClipByGlobalNorm:
+            self.clipped_grads, self.grad_norms = tf.clip_by_global_norm(self.tensor_gradients,
+                                                                         self.network_parameters.clip_gradients)
+        elif self.network_parameters.gradients_clipping_method == GradientClippingMethod.ClipByValue:
+            self.clipped_grads = [tf.clip_by_value(grad,
+                                                   -self.network_parameters.clip_gradients,
+                                                   self.network_parameters.clip_gradients)
+                                  for grad in self.tensor_gradients]
+        elif self.network_parameters.gradients_clipping_method == GradientClippingMethod.ClipByNorm:
+            self.clipped_grads = [tf.clip_by_norm(grad, self.network_parameters.clip_gradients)
+                                  for grad in self.tensor_gradients]
+
+    def _create_gradient_applying_ops(self):
+        """
+        Create tensorflow ops for applying the gradients to the network weights according to the training scheme
+        (distributed training - local or global network, shared optimizer, etc.)
+        :return: None
+        """
+        if self.network_is_global and self.network_parameters.shared_optimizer and \
+                not self.network_parameters.async_training:
+            # synchronous training with shared optimizer? -> create an operation for applying the gradients
+            # accumulated in the shared gradients accumulator
+            self.update_weights_from_shared_gradients = self.optimizer.apply_gradients(
+                zip(self.shared_accumulated_gradients, self.weights),
+                global_step=self.global_step)
+
+        elif self.distributed_training and self.network_is_local:
+            # distributed training but independent optimizer? -> create an operation for applying the gradients
+            # to the global weights
+            self.update_weights_from_batch_gradients = self.optimizer.apply_gradients(
+                zip(self.weights_placeholders, self.global_network.weights), global_step=self.global_step)
+
+        elif self.network_is_trainable:
+            # not any of the above but is trainable? -> create an operation for applying the gradients to
+            # this network weights
+            self.update_weights_from_batch_gradients = self.optimizer.apply_gradients(
+                zip(self.weights_placeholders, self.weights), global_step=self.global_step)
 
     def set_session(self, sess):
         self.sess = sess
 
         # initialize the session parameters in single threaded runs. Otherwise, this is done through the
-        # MonitoredSession object in the block factory
+        # MonitoredSession object in the graph manager
         if not isinstance(self.ap.task_parameters, DistributedTaskParameters):
             self.sess.run(self.init_op)
 
             if self.ap.visualization.tensorboard:
                 # Write the merged summaries to the current experiment directory
-                self.train_writer = tf.summary.FileWriter(self.ap.task_parameters.experiment_path + '/tensorboard',
-                                                          self.sess.graph)
+                self.train_writer = tf.summary.FileWriter(self.ap.task_parameters.experiment_path + '/tensorboard')
+                self.train_writer.add_graph(self.sess.graph)
 
         # wait for all the workers to set their session
         if not self.network_is_local:
-            self.wait_for_all_workers('lock')  # TODO: currently this won't work properly for >1 agents per task
+            self.wait_for_all_workers_barrier()  # TODO: currently this won't work properly for >1 agents per task
 
     def reset_accumulated_gradients(self):
         """
@@ -192,7 +360,8 @@ class TensorFlowArchitecture(Architecture):
         for ix, grad in enumerate(self.accumulated_gradients):
             self.accumulated_gradients[ix] = grad * 0
 
-    def accumulate_gradients(self, inputs, targets, additional_fetches=None, importance_weights=None):
+    def accumulate_gradients(self, inputs, targets, additional_fetches=None, importance_weights=None,
+                             no_accumulation=False):
         """
         Runs a forward pass & backward pass, clips gradients if needed and accumulates them into the accumulation
         placeholders
@@ -201,6 +370,9 @@ class TensorFlowArchitecture(Architecture):
         :param targets: The targets corresponding to the input batch
         :param importance_weights: A coefficient for each sample in the batch, which will be used to rescale the loss
                                    error of this sample. If it is not given, the samples losses won't be scaled
+        :param no_accumulation: If is set to True, the gradients in the accumulated gradients placeholder will be
+                                replaced by the newely calculated gradients instead of accumulating the new gradients.
+                                This can speed up the function runtime by around 10%.
         :return: A list containing the total loss and the individual network heads losses
         """
 
@@ -210,7 +382,7 @@ class TensorFlowArchitecture(Architecture):
         # feed inputs
         if additional_fetches is None:
             additional_fetches = []
-        feed_dict = self._feed_dict(inputs)
+        feed_dict = self.create_feed_dict(inputs)
 
         # feed targets
         targets = force_list(targets)
@@ -221,48 +393,45 @@ class TensorFlowArchitecture(Architecture):
         importance_weights = force_list(importance_weights)
         for placeholder_idx, target_ph in enumerate(targets):
             if len(importance_weights) <= placeholder_idx or importance_weights[placeholder_idx] is None:
-                importance_weight = np.ones(targets[placeholder_idx].shape[0])
+                importance_weight = np.ones(target_ph.shape[0])
             else:
                 importance_weight = importance_weights[placeholder_idx]
+            importance_weight = np.reshape(importance_weight, (-1,) + (1,)*(len(target_ph.shape)-1))
+
             feed_dict[self.importance_weights[placeholder_idx]] = importance_weight
 
         if self.optimizer_type != 'LBFGS':
-            # set the fetches
-            fetches = [self.gradients_norm]
-            if self.network_parameters.clip_gradients:
-                fetches.append(self.clipped_grads)
-            else:
-                fetches.append(self.tensor_gradients)
-            fetches += [self.total_loss, self.losses]
-            if self.network_parameters.middleware_type == MiddlewareTypes.LSTM:
-                fetches.append(self.middleware_embedder.state_out)
-            additional_fetches_start_idx = len(fetches)
-            fetches += additional_fetches
 
             # feed the lstm state if necessary
-            if self.network_parameters.middleware_type == MiddlewareTypes.LSTM:
+            if self.middleware.__class__.__name__ == 'LSTMMiddleware':
                 # we can't always assume that we are starting from scratch here can we?
-                feed_dict[self.middleware_embedder.c_in] = self.middleware_embedder.c_init
-                feed_dict[self.middleware_embedder.h_in] = self.middleware_embedder.h_init
+                feed_dict[self.middleware.c_in] = self.middleware.c_init
+                feed_dict[self.middleware.h_in] = self.middleware.h_init
 
-            fetches += [self.merged]
+            fetches = self.train_fetches + additional_fetches
+            if self.ap.visualization.tensorboard:
+                fetches += [self.merged]
+
             # get grads
             result = self.sess.run(fetches, feed_dict=feed_dict)
             if hasattr(self, 'train_writer') and self.train_writer is not None:
-                self.train_writer.add_summary(result[-1], self.ap.current_episode)
+                self.train_writer.add_summary(result[-1], self.sess.run(self.global_step))
 
             # extract the fetches
             norm_unclipped_grads, grads, total_loss, losses = result[:4]
-            if self.network_parameters.middleware_type == MiddlewareTypes.LSTM:
+            if self.middleware.__class__.__name__ == 'LSTMMiddleware':
                 (self.curr_rnn_c_in, self.curr_rnn_h_in) = result[4]
             fetched_tensors = []
             if len(additional_fetches) > 0:
-                fetched_tensors = result[additional_fetches_start_idx:additional_fetches_start_idx +
+                fetched_tensors = result[self.additional_fetches_start_idx:self.additional_fetches_start_idx +
                                                                       len(additional_fetches)]
 
             # accumulate the gradients
             for idx, grad in enumerate(grads):
-                self.accumulated_gradients[idx] += grad
+                if no_accumulation:
+                    self.accumulated_gradients[idx] = grad
+                else:
+                    self.accumulated_gradients[idx] += grad
 
             return total_loss, losses, norm_unclipped_grads, fetched_tensors
 
@@ -271,7 +440,7 @@ class TensorFlowArchitecture(Architecture):
 
             return [0]
 
-    def _feed_dict(self, inputs):
+    def create_feed_dict(self, inputs):
         feed_dict = {}
         for input_name, input_value in inputs.items():
             if isinstance(input_name, str):
@@ -308,26 +477,44 @@ class TensorFlowArchitecture(Architecture):
         self.apply_gradients(gradients, scaler)
         self.reset_accumulated_gradients()
 
-    def wait_for_all_workers(self, lock: str):
+    def wait_for_all_workers_to_lock(self, lock: str, include_only_training_workers: bool=False):
         """
-        A barrier that allows waiting for all the workers to finish a certain block of commands
+        Waits for all the workers to lock a certain lock and then continues
         :param lock: the name of the lock to use
+        :param include_only_training_workers: wait only for training workers or for all the workers?
         :return: None
         """
-        # TODO: try to move this function up in the hierarchy
+        if include_only_training_workers:
+            num_workers_to_wait_for = self.ap.task_parameters.num_training_tasks
+        else:
+            num_workers_to_wait_for = self.ap.task_parameters.num_tasks
+
         # lock
         if hasattr(self, '{}_counter'.format(lock)):
             self.sess.run(getattr(self, lock))
-            while self.sess.run(getattr(self, '{}_counter'.format(lock))) % self.ap.task_parameters.num_tasks != 0:
+            while self.sess.run(getattr(self, '{}_counter'.format(lock))) % num_workers_to_wait_for != 0:
                 time.sleep(0.00001)
+            # self.sess.run(getattr(self, '{}_init'.format(lock)))
         else:
             raise ValueError("no counter was defined for the lock {}".format(lock))
+
+    def wait_for_all_workers_barrier(self, include_only_training_workers: bool=False):
+        """
+        A barrier that allows waiting for all the workers to finish a certain block of commands
+        :param include_only_training_workers: wait only for training workers or for all the workers?
+        :return: None
+        """
+        self.wait_for_all_workers_to_lock('lock', include_only_training_workers=include_only_training_workers)
+        self.sess.run(self.lock_init)
+        self.wait_for_all_workers_to_lock('release', include_only_training_workers=include_only_training_workers)
+        self.sess.run(self.release_init)
 
     def apply_gradients(self, gradients, scaler=1.):
         """
         Applies the given gradients to the network weights
         :param gradients: The gradients to use for the update
-        :param scaler: A scaling factor that allows rescaling the gradients before applying them
+        :param scaler: A scaling factor that allows rescaling the gradients before applying them.
+                       The gradients will be MULTIPLIED by this factor
         """
         if self.network_parameters.async_training or not isinstance(self.ap.task_parameters, DistributedTaskParameters):
             if hasattr(self, 'global_step') and not self.network_is_local:
@@ -335,49 +522,65 @@ class TensorFlowArchitecture(Architecture):
 
         if self.optimizer_type != 'LBFGS':
 
-            # lock barrier
-            # TODO: use wait_for_all_workers
-            if hasattr(self, 'lock_counter'):
-                self.sess.run(self.lock)
-                while self.sess.run(self.lock_counter) % self.ap.task_parameters.num_training_tasks != 0:
-                    time.sleep(0.00001)
+            if self.distributed_training and not self.network_parameters.async_training:
                 # rescale the gradients so that they average out with the gradients from the other workers
-                scaler /= float(self.ap.task_parameters.num_training_tasks)
+                if self.network_parameters.scale_down_gradients_by_number_of_workers_for_sync_training:
+                    scaler /= float(self.ap.task_parameters.num_training_tasks)
 
-            # apply gradients
+            # rescale the gradients
             if scaler != 1.:
                 for gradient in gradients:
-                    gradient /= scaler
-            feed_dict = dict(zip(self.weights_placeholders, gradients))
+                    gradient *= scaler
 
-            _ = self.sess.run(self.update_weights_from_batch_gradients, feed_dict=feed_dict)
+            # apply the gradients
+            feed_dict = dict(zip(self.weights_placeholders, gradients))
+            if self.distributed_training and self.network_parameters.shared_optimizer \
+                    and not self.network_parameters.async_training:
+                # synchronous distributed training with shared optimizer:
+                # - each worker adds its gradients to the shared gradients accumulators
+                # - we wait for all the workers to add their gradients
+                # - the chief worker (worker with task index = 0) applies the gradients once and resets the accumulators
+
+                self.sess.run(self.accumulate_shared_gradients, feed_dict=feed_dict)
+
+                self.wait_for_all_workers_barrier(include_only_training_workers=True)
+
+                if self.is_chief:
+                    self.sess.run(self.update_weights_from_shared_gradients)
+                    self.sess.run(self.init_shared_accumulated_gradients)
+            else:
+                # async distributed training / distributed training with independent optimizer
+                #  / non-distributed training - just apply the gradients
+                feed_dict = dict(zip(self.weights_placeholders, gradients))
+                self.sess.run(self.update_weights_from_batch_gradients, feed_dict=feed_dict)
 
             # release barrier
-            if hasattr(self, 'release_counter'):
-                self.sess.run(self.release)
-                while self.sess.run(self.release_counter) % self.ap.task_parameters.num_training_tasks != 0:
-                    time.sleep(0.00001)
+            if self.distributed_training and not self.network_parameters.async_training:
+                self.wait_for_all_workers_barrier(include_only_training_workers=True)
 
-    def predict(self, inputs, outputs=None, squeeze_output=True):
+    def predict(self, inputs, outputs=None, squeeze_output=True, initial_feed_dict=None):
         """
         Run a forward pass of the network using the given input
         :param inputs: The input for the network
         :param outputs: The output for the network, defaults to self.outputs
         :param squeeze_output: call squeeze_list on output
+        :param initial_feed_dict: a dictionary to use as the initial feed_dict. other inputs will be added to this dict
         :return: The network output
 
         WARNING: must only call once per state since each call is assumed by LSTM to be a new time step.
         """
-
-        feed_dict = self._feed_dict(inputs)
+        feed_dict = self.create_feed_dict(inputs)
+        if initial_feed_dict:
+            feed_dict.update(initial_feed_dict)
         if outputs is None:
             outputs = self.outputs
 
-        if self.network_parameters.middleware_type == MiddlewareTypes.LSTM:
-            feed_dict[self.middleware_embedder.c_in] = self.curr_rnn_c_in
-            feed_dict[self.middleware_embedder.h_in] = self.curr_rnn_h_in
+        if self.middleware.__class__.__name__ == 'LSTMMiddleware':
+            feed_dict[self.middleware.c_in] = self.curr_rnn_c_in
+            feed_dict[self.middleware.h_in] = self.curr_rnn_h_in
 
-            output, (self.curr_rnn_c_in, self.curr_rnn_h_in) = self.sess.run([outputs, self.middleware_embedder.state_out], feed_dict=feed_dict)
+            output, (self.curr_rnn_c_in, self.curr_rnn_h_in) = self.sess.run([outputs, self.middleware.state_out],
+                                                                             feed_dict=feed_dict)
         else:
             output = self.sess.run(outputs, feed_dict)
 
@@ -438,3 +641,13 @@ class TensorFlowArchitecture(Architecture):
         :param placeholder: a placeholder to hold the given value for injecting it into the variable
         """
         self.sess.run(assign_op, feed_dict={placeholder: value})
+
+    def reset_internal_memory(self):
+        """
+        Reset any internal memory used by the network. For example, an LSTM internal state
+        :return: None
+        """
+        # initialize LSTM hidden states
+        if self.middleware.__class__.__name__ == 'LSTMMiddleware':
+            self.curr_rnn_c_in = self.middleware.c_init
+            self.curr_rnn_h_in = self.middleware.h_init

@@ -15,19 +15,25 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
+
+from architectures.tensorflow_components.heads.head import Head, HeadParameters
+from base_parameters import AgentParameters
 from core_types import QActionStateValue
+from spaces import BoxActionSpace
 from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head
-from spaces import Box
+
+
+class NAFHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='tanh', name: str='naf_head_params'):
+        super().__init__(parameterized_class=NAFHead, activation_function=activation_function, name=name)
 
 
 class NAFHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
-        if not isinstance(self.spaces.action, Box):
-            raise ValueError("NAF works only for continuous action spaces (Box)")
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True,activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
+        if not isinstance(self.spaces.action, BoxActionSpace):
+            raise ValueError("NAF works only for continuous action spaces (BoxActionSpace)")
 
         self.name = 'naf_q_values_head'
         self.num_actions = self.spaces.action.shape[0]
@@ -47,7 +53,7 @@ class NAFHead(Head):
         self.V = tf.layers.dense(input_layer, 1, name='V')
 
         # mu Head
-        mu_unscaled = tf.layers.dense(input_layer, self.num_actions, activation=tf.nn.tanh, name='mu_unscaled')
+        mu_unscaled = tf.layers.dense(input_layer, self.num_actions, activation=self.activation_function, name='mu_unscaled')
         self.mu = tf.multiply(mu_unscaled, self.output_scale, name='mu')
 
         # A Head

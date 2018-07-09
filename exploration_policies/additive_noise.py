@@ -14,12 +14,14 @@
 # limitations under the License.
 #
 
+from typing import List
+
 import numpy as np
+
+from core_types import RunPhase, ActionType
 from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
 from schedules import Schedule, LinearSchedule
-from spaces import ActionSpace, Box
-from core_types import RunPhase, ActionType
-from typing import List
+from spaces import ActionSpace, BoxActionSpace
 
 
 class AdditiveNoiseParameters(ExplorationParameters):
@@ -46,7 +48,7 @@ class AdditiveNoise(ExplorationPolicy):
         self.noise_percentage_schedule = noise_percentage_schedule
         self.evaluation_noise_percentage = evaluation_noise_percentage
 
-        if not isinstance(action_space, Box):
+        if not isinstance(action_space, BoxActionSpace):
             raise ValueError("Additive noise exploration works only for continuous controls."
                              "The given action space is of type: {}".format(action_space.__class__.__name__))
 
@@ -67,7 +69,12 @@ class AdditiveNoise(ExplorationPolicy):
         action_values_std = 2 * current_noise_precentage * self.action_space.max_abs_range
 
         # extract the mean values
-        action_values_mean = action_values[0].squeeze()
+        if isinstance(action_values, list):
+            # the action values are expected to be a list with the action mean and optionally the action stdev
+            action_values_mean = action_values[0].squeeze()
+        else:
+            # the action values are expected to be a numpy array representing the action mean
+            action_values_mean = action_values.squeeze()
 
         # step the noise schedule
         if self.phase == RunPhase.TRAIN:

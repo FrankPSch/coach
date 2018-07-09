@@ -13,23 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+import os
+from collections import OrderedDict
 from typing import Union
 
-from agents.agent import Agent
 import pygame
 from pandas import to_pickle
 
-from agents.bc_agent import BCAlgorithmParameters, BCNetworkParameters
-from configurations import AlgorithmParameters, NetworkParameters, InputEmbedderParameters, MiddlewareTypes, \
-    EmbedderScheme, OutputTypes, AgentParameters
+from agents.agent import Agent
+from agents.bc_agent import BCNetworkParameters
+from architectures.tensorflow_components.heads.policy_head import PolicyHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AlgorithmParameters, NetworkParameters, InputEmbedderParameters, EmbedderScheme,  \
+    AgentParameters
 from core_types import ActionInfo
 from exploration_policies.e_greedy import EGreedyParameters
 from logger import screen
-import os
-from collections import OrderedDict
-
-
-# TODO: this whole agent requires major refactoring
 from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
 
 
@@ -41,16 +41,14 @@ class HumanAlgorithmParameters(AlgorithmParameters):
 class HumanNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.embedder_scheme = EmbedderScheme.Medium
-        self.output_types = [OutputTypes.Pi]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.input_embedders_parameters['observation'].scheme = EmbedderScheme.Medium
+        self.middleware_parameters = FCMiddlewareParameters()
+        self.heads_parameters = [PolicyHeadParameters()]
         self.loss_weights = [1.0]
         self.optimizer_type = 'Adam'
         self.batch_size = 32
-        self.hidden_layers_activation_function = 'relu'
         self.replace_mse_with_huber_loss = True  # TODO: need to try both
-        self.neon_support = True
         self.create_target_network = False
 
 

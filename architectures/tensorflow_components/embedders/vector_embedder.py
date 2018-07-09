@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import List
 
 import tensorflow as tf
-from configurations import EmbedderScheme
+
+from architectures.tensorflow_components.architecture import batchnorm_activation_dropout, Dense
 from architectures.tensorflow_components.embedders.embedder import InputEmbedder
+from base_parameters import EmbedderScheme
 from core_types import InputVectorEmbedding
 
 
@@ -32,66 +35,30 @@ class VectorEmbedder(InputEmbedder):
 
         EmbedderScheme.Shallow:
             [
-                [128]
+                Dense([128])
             ],
 
         # dqn
         EmbedderScheme.Medium:
             [
-                [256]  # TODO: define this as 128?
+                Dense([256])  # TODO: define this as 128?
             ],
 
         # carla
         EmbedderScheme.Deep: \
             [
-                [128],
-                [128],
-                [128]
+                Dense([128]),
+                Dense([128]),
+                Dense([128])
             ]
     }
 
     def __init__(self, input_size: List[int], activation_function=tf.nn.relu,
-                 embedder_scheme: EmbedderScheme=EmbedderScheme.Medium, embedder_width_multiplier: int=1,
-                 use_batchnorm: bool=False, use_dropout: bool=False,
-                 name: str= "embedder"):
-        super().__init__(input_size, activation_function, embedder_scheme, embedder_width_multiplier,
-                         use_batchnorm, use_dropout, name)
+                 scheme: EmbedderScheme=EmbedderScheme.Medium, batchnorm: bool=False, dropout: bool=False,
+                 name: str= "embedder", input_normalization=(1.0, 0.0), input_clipping=None):
+        super().__init__(input_size, activation_function, scheme, batchnorm, dropout, name, input_normalization,
+                         input_clipping)
+
         self.return_type = InputVectorEmbedding
-        self.layers = []
-        if len(self.input_size) != 1 and embedder_scheme != EmbedderScheme.Empty:
+        if len(self.input_size) != 1 and scheme != EmbedderScheme.Empty:
             raise ValueError("The input size of a vector embedder must contain only a single dimension")
-
-    def _build_module(self):
-        # vector observation
-        input_layer = tf.contrib.layers.flatten(self.input)
-        self.layers.append(input_layer)
-
-        if isinstance(self.embedder_scheme, EmbedderScheme):
-            layers_params = self.schemes[self.embedder_scheme]
-        else:
-            layers_params = self.embedder_scheme
-        for idx, layer_params in enumerate(layers_params):
-            self.layers.append(
-                tf.layers.dense(self.layers[-1], layer_params[0] * self.embedder_width_multiplier,
-                                activation=self.activation_function, name='fc{}'.format(idx))
-            )
-
-            # batchnorm
-            if self.use_batchnorm:
-                self.layers.append(
-                    tf.layers.batch_normalization(self.layers[-1], name="batchnorm{}".format(idx))
-                )
-
-            # activation
-            if self.activation_function:
-                self.layers.append(
-                    self.activation_function(self.layers[-1], name="activation{}".format(idx))
-                )
-
-            # dropout
-            if self.use_dropout:
-                self.layers.append(
-                    tf.layers.dropout(self.layers[-1], self.dropout_rate, name="dropout{}".format(idx))
-                )
-
-        self.output = self.layers[-1]

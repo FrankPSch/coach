@@ -13,26 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
-from exploration_policies.ou_process import OUProcessParameters
 import numpy as np
-from core_types import ActionInfo, EnvironmentSteps
-from spaces import Box
-from configurations import AlgorithmParameters, AgentParameters, MiddlewareTypes, OutputTypes, \
+
+from agents.value_optimization_agent import ValueOptimizationAgent
+from architectures.tensorflow_components.heads.naf_head import NAFHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AlgorithmParameters, AgentParameters, \
     NetworkParameters, InputEmbedderParameters
+from core_types import ActionInfo, EnvironmentSteps
+from exploration_policies.ou_process import OUProcessParameters
 from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
+from spaces import BoxActionSpace
 
 
 class NAFNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.NAF]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.middleware_parameters = FCMiddlewareParameters()
+        self.heads_parameters = [NAFHeadParameters()]
         self.loss_weights = [1.0]
-        self.hidden_layers_activation_function = 'relu'
         self.optimizer_type = 'Adam'
         self.learning_rate = 0.001
         self.async_training = True
@@ -70,33 +73,32 @@ class NAFAgent(ValueOptimizationAgent):
         self.TD_targets = self.register_signal("TD targets")
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # TD error = r + discount*v_st_plus_1 - q_st
         v_st_plus_1 = self.networks['main'].target_network.predict(
-            next_states,
+            batch.next_states(network_keys),
             self.networks['main'].target_network.output_heads[0].V,
             squeeze_output=False,
         )
-        TD_targets = np.expand_dims(rewards, -1) + \
-                     (1.0 - np.expand_dims(game_overs, -1)) * self.ap.algorithm.discount * v_st_plus_1
-
-        if len(actions.shape) == 1:
-            actions = np.expand_dims(actions, -1)
+        TD_targets = np.expand_dims(batch.rewards(), -1) + \
+                     (1.0 - np.expand_dims(batch.game_overs(), -1)) * self.ap.algorithm.discount * v_st_plus_1
 
         self.TD_targets.add_sample(TD_targets)
 
-        result = self.networks['main'].train_and_sync_networks({**current_states, 'output_0_0': actions}, TD_targets)
+        result = self.networks['main'].train_and_sync_networks({**batch.states(network_keys),
+                                                                'output_0_0': batch.actions(len(batch.actions().shape) == 1)
+                                                                }, TD_targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads
 
     def choose_action(self, curr_state):
-        if type(self.spaces.action) != Box:
+        if type(self.spaces.action) != BoxActionSpace:
             raise ValueError('NAF works only for continuous control problems')
 
         # convert to batch so we can run it through the network
-        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'main')
+        tf_input_state = self.prepare_batch_for_inference(curr_state, 'main')
         naf_head = self.networks['main'].online_network.output_heads[0]
         action_values = self.networks['main'].online_network.predict(tf_input_state, outputs=naf_head.mu,
                                                                      squeeze_output=False)

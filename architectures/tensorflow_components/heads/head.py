@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import inspect
+from typing import Type
 
-import tensorflow as tf
-from utils import force_list
-from configurations import AgentParameters
-from spaces import ObservationSpace, ActionSpace, MeasurementsObservationSpace, SpacesDefinition
 import numpy as np
+import tensorflow as tf
+import os
+
+from base_parameters import AgentParameters, Parameters
+from spaces import SpacesDefinition
+from tensorflow.python.ops.losses.losses_impl import Reduction
+from utils import force_list
 
 
 # Used to initialize weights for policy and value output layers
@@ -30,6 +35,14 @@ def normalized_columns_initializer(std=1.0):
     return _initializer
 
 
+class HeadParameters(Parameters):
+    def __init__(self, parameterized_class: Type['Head'], activation_function: str = 'relu', name: str= 'head'):
+        super().__init__()
+        self.activation_function = activation_function
+        self.name = name
+        self.parameterized_class_name = parameterized_class.__name__
+
+
 class Head(object):
     """
     A head is the final part of the network. It takes the embedding from the middleware embedder and passes it through
@@ -37,7 +50,7 @@ class Head(object):
     an assigned loss function. The heads are algorithm dependent.
     """
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int=0, loss_weight: float=1., is_local: bool=True):
+                 head_idx: int=0, loss_weight: float=1., is_local: bool=True, activation_function: str='relu'):
         self.head_idx = head_idx
         self.network_name = network_name
         self.network_parameters = agent_parameters.network_wrappers[self.network_name]
@@ -54,6 +67,7 @@ class Head(object):
         self.ap = agent_parameters
         self.spaces = spaces
         self.return_type = None
+        self.activation_function = activation_function
 
     def __call__(self, input_layer):
         """
@@ -113,23 +127,41 @@ class Head(object):
         """
 
         # there are heads that define the loss internally, but we need to create additional placeholders for them
-        for loss in self.loss:
-            importance_weight = tf.placeholder('float', [None],
+        for idx in range(len(self.loss)):
+            importance_weight = tf.placeholder('float',
+                                               [None] + [1] * (len(self.target[idx].shape) - 1),
                                                '{}_importance_weight'.format(self.get_name()))
             self.importance_weight.append(importance_weight)
 
         # add losses and target placeholder
         for idx in range(len(self.loss_type)):
+            # create target placeholder
             target = tf.placeholder('float', self.output[idx].shape, '{}_target'.format(self.get_name()))
             self.target.append(target)
-            importance_weight = tf.placeholder('float', [None],
+
+            # create importance sampling weights placeholder
+            num_target_dims = len(self.target[idx].shape)
+            importance_weight = tf.placeholder('float', [None] + [1] * (num_target_dims - 1),
                                                '{}_importance_weight'.format(self.get_name()))
             self.importance_weight.append(importance_weight)
-            loss_weight = tf.expand_dims(self.loss_weight[idx]*importance_weight, axis=-1)
+
+            # compute the weighted loss. importance_weight weights over the samples in the batch, while self.loss_weight
+            # weights the specific loss of this head against other losses in this head or in other heads
+            loss_weight = self.loss_weight[idx]*importance_weight
             loss = self.loss_type[idx](self.target[-1], self.output[idx],
-                                       weights=loss_weight, scope=self.get_name())
+                                       scope=self.get_name(), reduction=Reduction.NONE, loss_collection=None)
+
+            # the loss is first summed over each sample in the batch and then the mean over the batch is taken
+            loss = tf.reduce_mean(loss_weight*tf.reduce_sum(loss, axis=list(range(1, num_target_dims))))
+
+            # we add the loss to the losses collection and later we will extract it in general_network
+            tf.losses.add_loss(loss)
             self.loss.append(loss)
 
         # add regularizations
         for regularization in self.regularizations:
             self.loss.append(regularization)
+
+    @classmethod
+    def path(cls):
+        return cls.__class__.__name__

@@ -16,16 +16,33 @@
 
 from typing import Union, List, Dict
 
-from core_types import EnvResponse, ActionInfo, RunPhase, StateType, ActionType, PredictionType
 import numpy as np
 
-from utils import force_list
+from core_types import EnvResponse, ActionInfo, RunPhase, PredictionType, ActionType
 
 
 class AgentInterface(object):
     def __init__(self):
         self._phase = RunPhase.HEATUP
+        self._parent = None
         self.spaces = None
+
+    @property
+    def parent(self):
+        """
+        Get the parent class of the agent
+        :return: the current phase
+        """
+        return self._parent
+
+    @parent.setter
+    def parent(self, val):
+        """
+        Change the parent class of the agent
+        :param val: the new parent
+        :return: None
+        """
+        self._parent = val
 
     @property
     def phase(self) -> RunPhase:
@@ -44,7 +61,7 @@ class AgentInterface(object):
         """
         self._phase = val
 
-    def reset(self) -> None:
+    def reset_internal_state(self) -> None:
         """
         Reset the episode parameters for the agent
         :return: None
@@ -80,10 +97,10 @@ class AgentInterface(object):
         """
         raise NotImplementedError("")
 
-    def save_model(self, model_id: str) -> None:
+    def save_checkpoint(self, checkpoint_id: int) -> None:
         """
         Save the model of the agent to the disk. This can contain the network parameters, the memory of the agent, etc.
-        :param model_id: the model if to use for saving
+        :param checkpoint_id: the checkpoint id to use for saving
         :return: None
         """
         raise NotImplementedError("")
@@ -98,53 +115,11 @@ class AgentInterface(object):
         """
         raise NotImplementedError("")
 
-
-
-    #
-    # def get_v_values_for_states(self, states: Union[StateType, List[StateType]]) -> np.ndarray:
-    #     """
-    #     Get a V value prediction for a batch of states. Agents that do not have a value prediction should raise a
-    #      ValueError.
-    #     :param states:
-    #     :return:  a list of values for each state in the batch
-    #     """
-    #
-    #     cannot_predict_v_error = ValueError("Cannot predict a V value, as the agent does not have a V head or a Q head")
-    #     states = force_list(states)
-    #
-    #     if not self.can_predict_v():
-    #         if not self.can_predict_q():
-    #             raise cannot_predict_v_error
-    #
-    #         q_values = self.get_all_q_values_for_states(states) # q_values is now a list of np.ndarray, with q_value per
-    #                                                             #  action
-    #         return np.mean(q_values, axis=1)
-    #
-    # def get_q_values_for_action_state_pairs(self, actions: ActionType,
-    #                                         states: Union[StateType, List[StateType]]) -> Union[float, List[float]]:
-    #     """
-    #     Get a Q value prediction for a batch of action-state pairs. Agents that do not have a Q value prediction should
-    #      raise a ValueError.
-    #     :param actions:
-    #     :param states:
-    #     :return:  a list of values for each state in the batch
-    #     """
-    #
-    #     pass
-    #
-    # def get_all_q_values_for_states(self, states: StateType):
-    #     if not self.can_predict_q():
-    #         raise ValueError("This agent type cannot predict Q values. ")
-    #
-    # def get_action_probabilities_for_states(self, states: StateType) -> np.ndarray:
-    #     if not self.can_predict_action_probabilities():
-    #         raise ValueError("This agent type cannot predict action probabilities. ")
-    #
-    # def can_predict_v(self):
-    #     return False
-    #
-    # def can_predict_q(self):
-    #     return False
-    #
-    # def can_predict_action_probabilities(self):
-    #     return False
+    def set_incoming_directive(self, action: ActionType) -> None:
+        """
+        Pass a higher level command (directive) to the agent.
+        For example, a higher level agent can set the goal of the agent.
+        :param action: the directive to pass to the agent
+        :return: None
+        """
+        raise NotImplementedError("")

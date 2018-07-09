@@ -14,21 +14,20 @@
 # limitations under the License.
 #
 
-
-from configurations import AgentParameters, VisualizationParameters
-from typing import Union, List, Dict, Type
-import numpy as np
-from utils import Enum, call_method_for_all, short_dynamic_import, set_member_values_for_all
-from environments.environment_interface import ActionSpace
-from spaces import AgentSelection, Attention
-from agents.agent_interface import AgentInterface
-from core_types import ActionInfo
-from core_types import EnvResponse, ActionType, Transition, RunPhase
-from filters.filter import InputFilter, OutputFilter
-from filters.observation.observation_crop_filter import ObservationCropFilter
-from spaces import ObservationSpace, SpacesDefinition
-import itertools
 import copy
+import itertools
+from typing import Union, List, Dict
+
+import numpy as np
+
+from agents.agent_interface import AgentInterface
+from base_parameters import AgentParameters, VisualizationParameters
+from core_types import ActionInfo, EnvResponse, ActionType, RunPhase
+from environments.environment_interface import ActionSpace
+from filters.observation.observation_crop_filter import ObservationCropFilter
+from spaces import AgentSelection, AttentionActionSpace, ObservationSpace, SpacesDefinition
+from utils import short_dynamic_import
+from enum import Enum
 
 
 class DecisionPolicy(object):
@@ -202,7 +201,7 @@ class CompositeAgent(AgentInterface):
         self.in_action_space = in_action_space
         self.out_action_space = out_action_space  # TODO: this is not being used
         self.reward_policy = reward_policy
-        self.name = name
+        self.full_name_id = self.name = name
         self.current_decision_maker = 0
         self.environment = None
         self.agents = {}  # key = agent_name, value = agent
@@ -230,6 +229,27 @@ class CompositeAgent(AgentInterface):
             raise ValueError("When the control policy is set to single decider, the master policy should control the"
                              "agent group via agent selection (ControlType.AgentSelection)")
 
+    @property
+    def parent(self):
+        """
+        Get the parent class of the composite agent
+        :return: the current phase
+        """
+        return self._parent
+
+    @parent.setter
+    def parent(self, val):
+        """
+        Change the parent class of the composite agent.
+        Additionally, updates the full name of the agent
+        :param val: the new parent
+        :return: None
+        """
+        self._parent = val
+        if not hasattr(self._parent, 'name'):
+            raise ValueError("The parent of a composite agent must have a name")
+        self.full_name_id = "{}/{}".format(self._parent.name, self.name)
+
     def create_agents(self):
         for agent_name, agent_parameters in self.agents_parameters.items():
             agent_parameters.name = agent_name
@@ -240,7 +260,7 @@ class CompositeAgent(AgentInterface):
             self.agents[agent_parameters.name].parent_level_manager = self.parent_level_manager
         # TODO: should this be defined here? it is a bit too specific, isn't it?
         # add an attention cropping filter if the incoming directives are attention boxes
-        if isinstance(self.in_action_space, Attention):
+        if isinstance(self.in_action_space, AttentionActionSpace):
             attention_size = self.in_action_space.forced_attention_size
             for agent in self.agents.values():
                 agent.input_filter.observation_filters['attention'] = \
@@ -293,9 +313,9 @@ class CompositeAgent(AgentInterface):
         :return: None
         """
         self.current_episode += 1
-        [agent.end_episode() for agent in self.agents.values()]
+        [agent.handle_episode_ended() for agent in self.agents.values()]
 
-    def reset(self) -> None:
+    def reset_internal_state(self) -> None:
         """
         Reset the episode for all the agents in the group
         :return: None
@@ -306,7 +326,7 @@ class CompositeAgent(AgentInterface):
         self.total_reward_in_current_episode = 0
 
         # reset all sub modules
-        [agent.reset() for agent in self.agents.values()]
+        [agent.reset_internal_state() for agent in self.agents.values()]
 
     def train(self) -> Union[float, List]:
         """
@@ -350,7 +370,7 @@ class CompositeAgent(AgentInterface):
         Given a response from the environment as a env_response, filter it and pass it to the agents.
         This method has two main jobs:
         1. Wrap the previous transition, ending with the new observation coming from EnvResponse.
-        2. Save the new_state as the current_state to take action upon for the next call to act().
+        2. Save the next_state as the current_state to take action upon for the next call to act().
 
         :param env_response:
         :param action_info: additional info about the chosen action
@@ -370,14 +390,14 @@ class CompositeAgent(AgentInterface):
 
         return episode_ended
 
-    def save_checkpoint(self, model_id: str="checkpoint") -> None:  # TODO: replace the default value
-        [agent.save_checkpoint(model_id) for agent in self.agents.values()]
+    def save_checkpoint(self, checkpoint_id: int) -> None:  # TODO: replace the default value
+        [agent.save_checkpoint(checkpoint_id) for agent in self.agents.values()]
 
     def set_incoming_directive(self, action: ActionType) -> None:
         self.incoming_action = action
         if isinstance(self.decision_policy, SingleDecider) and isinstance(self.in_action_space, AgentSelection):
             self.decision_policy.decision_maker = list(self.agents.keys())[action]
-        if isinstance(self.in_action_space, Attention):
+        if isinstance(self.in_action_space, AttentionActionSpace):
             # TODO: this is a hack
             for agent in self.agents.values():
                 agent.input_filter.observation_filters['attention'].crop_low = action[0]
@@ -390,7 +410,7 @@ class CompositeAgent(AgentInterface):
 
     def sync(self) -> None:
         """
-        Sync the global network parameters to the block
+        Sync the agent networks with the global network
         :return:
         """
         [agent.sync() for agent in self.agents.values()]

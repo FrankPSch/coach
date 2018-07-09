@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
 import numpy as np
+
 from agents.dqn_agent import DQNAgentParameters, DQNAlgorithmParameters
+from agents.value_optimization_agent import ValueOptimizationAgent
 
 
 class MixedMonteCarloAlgorithmParameters(DQNAlgorithmParameters):
@@ -42,20 +44,25 @@ class MixedMonteCarloAgent(ValueOptimizationAgent):
         self.mixing_rate = agent_parameters.algorithm.monte_carlo_mixing_rate
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, total_return = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
-        TD_targets = self.networks['main'].online_network.predict(current_states)
-        selected_actions = np.argmax(self.networks['main'].online_network.predict(next_states), 1)
-        q_st_plus_1 = self.networks['main'].target_network.predict(next_states)
+        selected_actions = np.argmax(self.networks['main'].online_network.predict(batch.next_states(network_keys)), 1)
+        q_st_plus_1, TD_targets = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.next_states(network_keys)),
+            (self.networks['main'].online_network, batch.states(network_keys))
+        ])
+
         # initialize with the current prediction so that we will
         #  only update the action that we have actually done in this transition
         for i in range(self.ap.network_wrappers['main'].batch_size):
-            one_step_target = rewards[i] + (1.0 - game_overs[i]) * self.ap.algorithm.discount * q_st_plus_1[i][
-                selected_actions[i]]
-            monte_carlo_target = total_return[i]
-            TD_targets[i, actions[i]] = (1 - self.mixing_rate) * one_step_target + self.mixing_rate * monte_carlo_target
+            one_step_target = batch.rewards()[i] + \
+                              (1.0 - batch.game_overs()[i]) * self.ap.algorithm.discount *\
+                              q_st_plus_1[i][selected_actions[i]]
+            monte_carlo_target = batch.total_returns()[i]
+            TD_targets[i, batch.actions()[i]] = (1 - self.mixing_rate) * one_step_target + \
+                                                self.mixing_rate * monte_carlo_target
 
-        result = self.networks['main'].train_and_sync_networks(current_states, TD_targets)
+        result = self.networks['main'].train_and_sync_networks(batch.states(network_keys), TD_targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads

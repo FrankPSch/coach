@@ -14,41 +14,61 @@
 # limitations under the License.
 #
 
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 
 
 class SharedRunningStats(object):
-    def __init__(self, replicated_device, epsilon=1e-2, name=""):
+    def __init__(self, replicated_device=None, epsilon=1e-2, name="", create_ops=True):
         self.sess = None
-        with tf.device(replicated_device):
-            with tf.variable_scope(name):
-                self._sum = tf.get_variable(
-                    dtype=tf.float64,
-                    initializer=tf.constant_initializer(0.0),
-                    name="running_sum", trainable=False, shape=[1], validate_shape=False)
-                self._sum_squared = tf.get_variable(
-                    dtype=tf.float64,
-                    initializer=tf.constant_initializer(epsilon),
-                    name="running_sum_squared", trainable=False, shape=[1], validate_shape=False)
-                self._count = tf.get_variable(
-                    dtype=tf.float64,
-                    shape=(),
-                    initializer=tf.constant_initializer(epsilon),
-                    name="count", trainable=False)
+        self.name = name
+        self.replicated_device = replicated_device
+        self.epsilon = epsilon
+        self.ops_were_created = False
+        if create_ops:
+            with tf.device(replicated_device):
+                self.create_ops()
 
-                self._shape = None
-                self._mean = self._sum / self._count
-                self._std = tf.sqrt(tf.maximum((self._sum_squared - self._count*tf.square(self._mean))
-                                               / tf.maximum(self._count-1, 1), epsilon))
+    def create_ops(self, shape=[1], clip_values=None):
+        self.clip_values = clip_values
+        with tf.variable_scope(self.name):
+            self._sum = tf.get_variable(
+                dtype=tf.float64,
+                initializer=tf.constant_initializer(0.0),
+                name="running_sum", trainable=False, shape=shape, validate_shape=False,
+                collections=[tf.GraphKeys.GLOBAL_VARIABLES])
+            self._sum_squared = tf.get_variable(
+                dtype=tf.float64,
+                initializer=tf.constant_initializer(self.epsilon),
+                name="running_sum_squared", trainable=False, shape=shape, validate_shape=False,
+                collections=[tf.GraphKeys.GLOBAL_VARIABLES])
+            self._count = tf.get_variable(
+                dtype=tf.float64,
+                shape=(),
+                initializer=tf.constant_initializer(self.epsilon),
+                name="count", trainable=False, collections=[tf.GraphKeys.GLOBAL_VARIABLES])
 
-                self.new_sum = tf.placeholder(dtype=tf.float64, name='sum')
-                self.new_sum_squared = tf.placeholder(dtype=tf.float64, name='var')
-                self.newcount = tf.placeholder(shape=[], dtype=tf.float64, name='count')
+            self._shape = None
+            self._mean = tf.div(self._sum, self._count, name="mean")
+            self._std = tf.sqrt(tf.maximum((self._sum_squared - self._count*tf.square(self._mean))
+                                           / tf.maximum(self._count-1, 1), self.epsilon), name="stdev")
+            self.tf_mean = tf.cast(self._mean, 'float32')
+            self.tf_std = tf.cast(self._std, 'float32')
 
-                self._inc_sum = tf.assign_add(self._sum, self.new_sum, use_locking=True)
-                self._inc_sum_squared = tf.assign_add(self._sum_squared, self.new_sum_squared, use_locking=True)
-                self._inc_count = tf.assign_add(self._count, self.newcount, use_locking=True)
+            self.new_sum = tf.placeholder(dtype=tf.float64, name='sum')
+            self.new_sum_squared = tf.placeholder(dtype=tf.float64, name='var')
+            self.newcount = tf.placeholder(shape=[], dtype=tf.float64, name='count')
+
+            self._inc_sum = tf.assign_add(self._sum, self.new_sum, use_locking=True)
+            self._inc_sum_squared = tf.assign_add(self._sum_squared, self.new_sum_squared, use_locking=True)
+            self._inc_count = tf.assign_add(self._count, self.newcount, use_locking=True)
+
+            self.raw_obs = tf.placeholder(dtype=tf.float64, name='raw_obs')
+            self.normalized_obs = (self.raw_obs - self._mean) / self._std
+            if self.clip_values is not None:
+                self.clipped_obs = tf.clip_by_value(self.normalized_obs, self.clip_values[0], self.clip_values[1])
+
+            self.ops_were_created = True
 
     def set_session(self, sess):
         self.sess = sess
@@ -83,3 +103,19 @@ class SharedRunningStats(object):
     @property
     def shape(self):
         return self._shape
+
+    @shape.setter
+    def shape(self, val):
+        self._shape = val
+        self.new_sum.set_shape(val)
+        self.new_sum_squared.set_shape(val)
+        self.tf_mean.set_shape(val)
+        self.tf_std.set_shape(val)
+        self._sum.set_shape(val)
+        self._sum_squared.set_shape(val)
+
+    def normalize(self, batch):
+        if self.clip_values is not None:
+            return self.sess.run(self.clipped_obs, feed_dict={self.raw_obs: batch})
+        else:
+            return self.sess.run(self.normalized_obs, feed_dict={self.raw_obs: batch})

@@ -14,18 +14,18 @@
 # limitations under the License.
 #
 
+from core_types import RewardType
 from filters.reward.reward_filter import RewardFilter
 from spaces import RewardSpace
-from core_types import RewardType
 
 
 class RewardRescaleFilter(RewardFilter):
     """
-    Rescales the reward by some factor
+    Rescales the reward by multiplying with some factor
     """
     def __init__(self, rescale_factor: float):
         """
-        :param rescale_factor: The reward rescaling factor
+        :param rescale_factor: The reward rescaling factor by which the reward will be multiplied
         """
         super().__init__()
         self.rescale_factor = rescale_factor
@@ -33,11 +33,11 @@ class RewardRescaleFilter(RewardFilter):
         if rescale_factor == 0:
             raise ValueError("The reward rescale value can not be set to 0")
 
-    def filter(self, reward: RewardType) -> RewardType:
-        reward = float(reward) / self.rescale_factor
+    def filter(self, reward: RewardType, update_internal_state: bool=True) -> RewardType:
+        reward = float(reward) * self.rescale_factor
         return reward
 
     def get_filtered_reward_space(self, input_reward_space: RewardSpace) -> RewardSpace:
-        input_reward_space.high = input_reward_space.high / self.rescale_factor
-        input_reward_space.low = input_reward_space.low / self.rescale_factor
+        input_reward_space.high = input_reward_space.high * self.rescale_factor
+        input_reward_space.low = input_reward_space.low * self.rescale_factor
         return input_reward_space

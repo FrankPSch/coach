@@ -14,10 +14,11 @@
 # limitations under the License.
 #
 
+import numpy as np
+
+from core_types import ObservationType
 from filters.observation.observation_filter import ObservationFilter
 from spaces import ObservationSpace
-from core_types import ObservationType
-import numpy as np
 
 
 class ObservationToUInt8Filter(ObservationFilter):
@@ -42,7 +43,7 @@ class ObservationToUInt8Filter(ObservationFilter):
                              .format(self.input_low, self.input_high,
                                      input_observation_space.low, input_observation_space.high))
 
-    def filter(self, observation: ObservationType) -> ObservationType:
+    def filter(self, observation: ObservationType, update_internal_state: bool=True) -> ObservationType:
         # scale to 0-1
         observation = (observation - self.input_low) / (self.input_high - self.input_low)
 

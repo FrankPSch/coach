@@ -1,6 +1,23 @@
-from typing import List
+#
+# Copyright (c) 2017 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import List, Tuple
 
 import numpy as np
+from core_types import EnvironmentSteps
 
 
 class Schedule(object):
@@ -45,26 +62,31 @@ class LinearSchedule(Schedule):
             self.current_value = np.clip(self.current_value, self.initial_value, self.final_value)
 
 
-class PieceWiseLinearSchedule(Schedule):
+class PieceWiseSchedule(Schedule):
     """
-    A schedule which is linear in several ranges
+    A schedule which consists of multiple sub-schedules, where each one is used for a defined number of steps
     """
-    def __init__(self, schedules: List[LinearSchedule]):
+    def __init__(self, schedules: List[Tuple[Schedule, EnvironmentSteps]]):
         """
-        :param schedules: a list of schedules to apply serially
+        :param schedules: a list of schedules to apply serially. Each element of the list should be a tuple of
+                          2 elements - a schedule and the number of steps to run it in terms of EnvironmentSteps
         """
-        super().__init__(schedules[0].initial_value)
+        super().__init__(schedules[0][0].initial_value)
         self.schedules = schedules
         self.current_schedule = schedules[0]
         self.current_schedule_idx = 0
+        self.current_schedule_step_count = 0
 
     def step(self):
-        if self.current_schedule_idx < len(self.schedules) - 1 and \
-                        self.current_schedule.final_value == self.current_schedule.current_value:
+        if self.current_schedule_idx < len(self.schedules) - 1 \
+                and self.current_schedule_step_count >= self.current_schedule[1].num_steps\
+                and self.current_schedule_idx < len(self.schedules) - 1:
             self.current_schedule_idx += 1
             self.current_schedule = self.schedules[self.current_schedule_idx]
-        self.current_schedule.step()
-        self.current_value = self.current_schedule.current_value
+            self.current_schedule_step_count = 0
+        self.current_schedule[0].step()
+        self.current_value = self.current_schedule[0].current_value
+        self.current_schedule_step_count += 1
 
 
 class ExponentialSchedule(Schedule):

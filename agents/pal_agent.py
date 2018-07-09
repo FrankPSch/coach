@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
 import numpy as np
 
-
 from agents.dqn_agent import DQNAgentParameters, DQNAlgorithmParameters
+from agents.value_optimization_agent import ValueOptimizationAgent
 
 
 class PALAlgorithmParameters(DQNAlgorithmParameters):
@@ -48,40 +48,43 @@ class PALAgent(ValueOptimizationAgent):
         self.monte_carlo_mixing_rate = agent_parameters.algorithm.monte_carlo_mixing_rate
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, total_return = self.extract_batch(batch, 'main')
-
-        selected_actions = np.argmax(self.networks['main'].online_network.predict(next_states), 1)
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # next state values
-        q_st_plus_1_target = self.networks['main'].target_network.predict(next_states)
+        q_st_plus_1_target, q_st_plus_1_online = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.next_states(network_keys)),
+            (self.networks['main'].online_network, batch.next_states(network_keys))
+        ])
+        selected_actions = np.argmax(q_st_plus_1_online, 1)
         v_st_plus_1_target = np.max(q_st_plus_1_target, 1)
 
-        # current state values according to online network
-        q_st_online = self.networks['main'].online_network.predict(current_states)
-
-        # current state values according to target network
-        q_st_target = self.networks['main'].target_network.predict(current_states)
+        # current state values
+        q_st_target, q_st_online = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.states(network_keys)),
+            (self.networks['main'].online_network, batch.states(network_keys))
+        ])
         v_st_target = np.max(q_st_target, 1)
 
         # calculate TD error
         TD_targets = np.copy(q_st_online)
         for i in range(self.ap.network_wrappers['main'].batch_size):
-            TD_targets[i, actions[i]] = rewards[i] + (1.0 - game_overs[i]) * self.ap.algorithm.discount * \
+            TD_targets[i, batch.actions()[i]] = batch.rewards()[i] + \
+                                        (1.0 - batch.game_overs()[i]) * self.ap.algorithm.discount * \
                                                      q_st_plus_1_target[i][selected_actions[i]]
-            advantage_learning_update = v_st_target[i] - q_st_target[i, actions[i]]
+            advantage_learning_update = v_st_target[i] - q_st_target[i, batch.actions()[i]]
             next_advantage_learning_update = v_st_plus_1_target[i] - q_st_plus_1_target[i, selected_actions[i]]
             # Persistent Advantage Learning or Regular Advantage Learning
             if self.persistent:
-                TD_targets[i, actions[i]] -= self.alpha * min(advantage_learning_update, next_advantage_learning_update)
+                TD_targets[i, batch.actions()[i]] -= self.alpha * min(advantage_learning_update, next_advantage_learning_update)
             else:
-                TD_targets[i, actions[i]] -= self.alpha * advantage_learning_update
+                TD_targets[i, batch.actions()[i]] -= self.alpha * advantage_learning_update
 
             # mixing monte carlo updates
-            monte_carlo_target = total_return[i]
-            TD_targets[i, actions[i]] = (1 - self.monte_carlo_mixing_rate) * TD_targets[i, actions[i]] \
+            monte_carlo_target = batch.total_returns()[i]
+            TD_targets[i, batch.actions()[i]] = (1 - self.monte_carlo_mixing_rate) * TD_targets[i, batch.actions()[i]] \
                                         + self.monte_carlo_mixing_rate * monte_carlo_target
 
-        result = self.networks['main'].train_and_sync_networks(current_states, TD_targets)
+        result = self.networks['main'].train_and_sync_networks(batch.states(network_keys), TD_targets)
         total_loss, losses, unclipped_grads = result[:3]
 
         return total_loss, losses, unclipped_grads

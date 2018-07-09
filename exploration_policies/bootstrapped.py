@@ -14,12 +14,16 @@
 # limitations under the License.
 #
 
+from typing import List
+
+import numpy as np
+
+from core_types import RunPhase, ActionType
 from exploration_policies.e_greedy import EGreedy, EGreedyParameters
 from schedules import Schedule, LinearSchedule
 from spaces import ActionSpace
-import numpy as np
-from core_types import RunPhase, ActionType
-from typing import List
+from exploration_policies.additive_noise import AdditiveNoiseParameters
+from exploration_policies.exploration_policy import ExplorationParameters
 
 
 class BootstrappedParameters(EGreedyParameters):
@@ -36,15 +40,17 @@ class BootstrappedParameters(EGreedyParameters):
 
 class Bootstrapped(EGreedy):
     def __init__(self, action_space: ActionSpace, epsilon_schedule: Schedule, evaluation_epsilon: float,
-                 noise_percentage_schedule: Schedule, architecture_num_q_heads: int):
+                 architecture_num_q_heads: int,
+                 continuous_exploration_policy_parameters: ExplorationParameters = AdditiveNoiseParameters(),):
         """
         :param action_space: the action space used by the environment
         :param epsilon_schedule: a schedule for the epsilon values
         :param evaluation_epsilon: the epsilon value to use for evaluation phases
-        :param noise_percentage_schedule: a schedule for the noise percentage values
+        :param continuous_exploration_policy_parameters: the parameters of the continuous exploration policy to use
+                                                         if the e-greedy is used for a continuous policy
         :param architecture_num_q_heads: the number of q heads to select from
         """
-        super().__init__(action_space, epsilon_schedule, evaluation_epsilon, noise_percentage_schedule)
+        super().__init__(action_space, epsilon_schedule, evaluation_epsilon, continuous_exploration_policy_parameters)
         self.num_heads = architecture_num_q_heads
         self.selected_head = 0
         self.last_action_values = 0

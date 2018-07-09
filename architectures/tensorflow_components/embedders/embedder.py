@@ -19,8 +19,11 @@ from typing import List, Union
 import numpy as np
 import tensorflow as tf
 
-from configurations import EmbedderScheme
+from architectures.tensorflow_components.architecture import batchnorm_activation_dropout
+from base_parameters import EmbedderScheme
 from core_types import InputEmbedding
+
+from architectures.tensorflow_components.shared_variables import SharedRunningStats
 
 
 class InputEmbedder(object):
@@ -30,20 +33,21 @@ class InputEmbedder(object):
     can be multiple embedders in a single network
     """
     def __init__(self, input_size: List[int], activation_function=tf.nn.relu,
-                 embedder_scheme: EmbedderScheme=EmbedderScheme.Medium, embedder_width_multiplier: int=1,
-                 use_batchnorm: bool=False, use_dropout: bool=False,
-                 name: str= "embedder"):
+                 scheme: EmbedderScheme=None, batchnorm: bool=False, dropout: bool=False,
+                 name: str= "embedder", input_normalization=(1.0, 0.0), input_clipping=None):
         self.name = name
         self.input_size = input_size
         self.activation_function = activation_function
-        self.use_batchnorm = use_batchnorm
-        self.use_dropout = use_dropout
+        self.batchnorm = batchnorm
+        self.dropout = dropout
         self.dropout_rate = 0
         self.input = None
         self.output = None
-        self.embedder_scheme = embedder_scheme
-        self.embedder_width_multiplier = embedder_width_multiplier
+        self.scheme = scheme
         self.return_type = InputEmbedding
+        self.layers = []
+        self.input_normalization = input_normalization
+        self.input_clipping = input_clipping
 
     def __call__(self, prev_input_placeholder=None):
         with tf.variable_scope(self.get_name()):
@@ -54,6 +58,43 @@ class InputEmbedder(object):
             self._build_module()
 
         return self.input, self.output
+
+    def _build_module(self):
+        # NOTE: for image inputs, we expect the data format to be of type uint8, so to be memory efficient. we chose not
+        #  to implement the rescaling as an input filters.observation.observation_filter, as this would have caused the
+        #  input to the network to be float, which is 4x more expensive in memory.
+        #  thus causing each saved transition in the memory to also be 4x more pricier.
+
+        # normalize input using running stats or constant given stats
+        if isinstance(self.input_normalization, SharedRunningStats):
+            if not self.input_normalization.ops_were_created:
+                self.input_normalization.create_ops(self.input.shape[1:])
+                self.input_normalization.shape = self.input.shape[1:]
+            input_layer = (self.input - self.input_normalization.tf_mean) / self.input_normalization.tf_std
+        else:
+            input_layer = (self.input - self.input_normalization[1]) / self.input_normalization[0]
+
+        # clip input using te given range
+        if self.input_clipping is not None:
+            input_layer = tf.clip_by_value(input_layer, self.input_clipping[0], self.input_clipping[1])
+
+        self.layers.append(input_layer)
+
+        # layers order is conv -> batchnorm -> activation -> dropout
+        if isinstance(self.scheme, EmbedderScheme):
+            layers_params = self.schemes[self.scheme]
+        else:
+            layers_params = self.scheme
+        for idx, layer_params in enumerate(layers_params):
+            self.layers.append(
+                layer_params(input_layer=self.layers[-1], name='{}_{}'.format(layer_params.__class__.__name__, idx))
+            )
+
+            self.layers.extend(batchnorm_activation_dropout(self.layers[-1], self.batchnorm,
+                                                            self.activation_function, self.dropout,
+                                                            self.dropout_rate, idx))
+
+        self.output = tf.contrib.layers.flatten(self.layers[-1])
 
     @property
     def input_size(self) -> List[int]:
@@ -71,8 +112,10 @@ class InputEmbedder(object):
             ).format(value=value, type=type(value)))
         self._input_size = value
 
-    def _build_module(self):
-        raise NotImplementedError("")
+    @property
+    def schemes(self):
+        raise NotImplementedError("Inheriting embedder must define schemes matching its allowed default "
+                                  "configurations.")
 
     def get_name(self):
         return self.name

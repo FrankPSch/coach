@@ -13,17 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import multiprocessing
 import tensorflow as tf
-from configurations import AgentParameters
-from spaces import SpacesDefinition
+
+from architectures.tensorflow_components.heads.head import HeadParameters
 from architectures.tensorflow_components.heads.q_head import QHead
+from base_parameters import AgentParameters
+from spaces import SpacesDefinition
+
+
+class DNDQHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='dnd_q_head_params'):
+        super().__init__(parameterized_class=DNDQHead, activation_function=activation_function, name=name)
 
 
 class DNDQHead(QHead):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'dnd_q_values_head'
         self.DND_size = agent_parameters.algorithm.dnd_size
         self.DND_key_error_threshold = agent_parameters.algorithm.DND_key_error_threshold
@@ -35,7 +41,7 @@ class DNDQHead(QHead):
         self.dnd_values = [None] * self.num_actions
         self.dnd_indices = [None] * self.num_actions
         self.dnd_distances = [None] * self.num_actions
-        if self.ap.memory.distributed_memory:
+        if self.ap.memory.shared_memory:
             self.shared_memory_scratchpad = self.ap.task_parameters.shared_memory_scratchpad
 
     def _build_module(self, input_layer):
@@ -45,8 +51,8 @@ class DNDQHead(QHead):
         else:
             from memories import differentiable_neural_dictionary
 
-            if self.network_parameters.checkpoint_restore_dir:
-                self.DND = differentiable_neural_dictionary.load_dnd(self.network_parameters.checkpoint_restore_dir)
+            if hasattr(self.ap.task_parameters, 'checkpoint_restore_dir') and self.ap.task_parameters.checkpoint_restore_dir:
+                self.DND = differentiable_neural_dictionary.load_dnd(self.ap.task_parameters.checkpoint_restore_dir)
             else:
                 self.DND = differentiable_neural_dictionary.QDND(
                     self.DND_size, input_layer.get_shape()[-1], self.num_actions, self.new_value_shift_coefficient,
@@ -54,35 +60,6 @@ class DNDQHead(QHead):
                     learning_rate=self.network_parameters.learning_rate,
                     num_neighbors=self.number_of_nn,
                     override_existing_keys=True)
-
-        # The below code snippet is not in use, as we had an issue with passing the DND through the scratchpad causing
-        # multiple errors which result from the use of the Annoy module. Currently, instead, a shared DND has to be
-        # initialized and passed externally and directly (not through the scratchpad), as done in the
-        # test_custom_actor_critic.
-
-        # my_agent_is_chief = self.ap.task_parameters.task_index == 0
-        # lookup_name = self.ap.full_name_id + '.DND'
-        # # TODO - currently the DND is not implemented as a memory. while this is broken, we will take abuse of the fact
-        # #        that in NEC, we have both a DND and a ER, and so if we decided to have a shared ER, we will also have a
-        # #        shared DND
-        # if self.ap.memory.distributed_memory is True and not my_agent_is_chief:
-        #     self.DND = self.shared_memory_scratchpad.get(lookup_name)
-        # else:
-        #     if self.ap.memory.distributed_memory:
-        #         from memories import protected_differentiable_neural_dictionary as differentiable_neural_dictionary
-        #     else:
-        #         from memories import differentiable_neural_dictionary
-        #
-        #     if self.network_parameters.checkpoint_restore_dir:
-        #         self.DND = differentiable_neural_dictionary.load_dnd(self.network_parameters.checkpoint_restore_dir)
-        #     else:
-        #         self.DND = differentiable_neural_dictionary.QDND(
-        #             self.DND_size, input_layer.get_shape()[-1], self.num_actions, self.new_value_shift_coefficient,
-        #             key_error_threshold=self.DND_key_error_threshold,
-        #             learning_rate=self.network_parameters.learning_rate)
-        #
-        #     if self.ap.memory.distributed_memory is True and my_agent_is_chief:
-        #         self.shared_memory_scratchpad.add(lookup_name, self.DND)
 
         # Retrieve info from DND dictionary
         # We assume that all actions have enough entries in the DND
@@ -105,7 +82,9 @@ class DNDQHead(QHead):
         self.dnd_distances[action] = distances
         weights = 1.0 / distances
         normalised_weights = weights / tf.reduce_sum(weights, axis=1, keep_dims=True)
-        return tf.reduce_sum(self.dnd_values[action] * normalised_weights, axis=1)
+        q_value = tf.reduce_sum(self.dnd_values[action] * normalised_weights, axis=1)
+        q_value.set_shape((None,))
+        return q_value
 
     def _post_build(self):
         # DND gradients

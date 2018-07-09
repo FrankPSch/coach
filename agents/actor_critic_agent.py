@@ -13,20 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.policy_optimization_agent import PolicyOptimizationAgent, PolicyGradientRescaler
-from logger import screen
-from utils import Signal, last_sample
-import scipy.signal
 import numpy as np
-from core_types import RunPhase, ActionInfo, VStateValue, QActionStateValue
-from spaces import Discrete, Box
-from utils import eps
-from configurations import AlgorithmParameters, NetworkParameters, InputTypes, OutputTypes, MiddlewareTypes, \
+import scipy.signal
+
+from agents.policy_optimization_agent import PolicyOptimizationAgent, PolicyGradientRescaler
+from architectures.tensorflow_components.heads.policy_head import PolicyHeadParameters
+from architectures.tensorflow_components.heads.v_head import VHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AlgorithmParameters, NetworkParameters, \
     AgentParameters, InputEmbedderParameters
-from exploration_policies.continuous_entropy import ContinuousEntropyParameters
+from core_types import ActionInfo, QActionStateValue
+from logger import screen
 from memories.single_episode_buffer import SingleEpisodeBufferParameters
+from spaces import DiscreteActionSpace, BoxActionSpace
+from utils import last_sample, eps
 
 
 class ActorCriticAlgorithmParameters(AlgorithmParameters):
@@ -43,13 +46,12 @@ class ActorCriticAlgorithmParameters(AlgorithmParameters):
 class ActorCriticNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.V, OutputTypes.Pi]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters()}
+        self.middleware_parameters = FCMiddlewareParameters()
+        self.heads_parameters = [VHeadParameters(), PolicyHeadParameters()]
         self.loss_weights = [0.5, 1.0]
         self.rescale_gradient_from_head_by_factor = [1, 1]
         self.optimizer_type = 'Adam'
-        self.hidden_layers_activation_function = 'relu'
         self.clip_gradients = 40.0
         self.async_training = True
 
@@ -106,14 +108,14 @@ class ActorCriticAgent(PolicyOptimizationAgent):
 
     def learn_from_batch(self, batch):
         # batch contains a list of episodes to learn from
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # get the values for the current states
         if self.policy_gradient_rescaler != PolicyGradientRescaler.CUSTOM_ACTOR_CRITIC:
-            result = self.networks['main'].online_network.predict(current_states)
+            result = self.networks['main'].online_network.predict(batch.states(network_keys))
             current_state_values = result[0]
         else:
-            current_state_values = self.get_value_for_states(current_states)
+            current_state_values = self.get_value_for_states(batch.states(network_keys))
         self.state_values.add_sample(current_state_values)
 
         # #DEBUG critic as an agent values vs. internal critic values
@@ -129,53 +131,55 @@ class ActorCriticAgent(PolicyOptimizationAgent):
         #     current_state_values = critic_state_values
 
         # the targets for the state value estimator
-        num_transitions = len(game_overs)
+        num_transitions = batch.size
         state_value_head_targets = np.zeros((num_transitions, 1))
 
         # estimate the advantage function
         action_advantages = np.zeros((num_transitions, 1))
 
         if self.policy_gradient_rescaler == PolicyGradientRescaler.A_VALUE:
-            if game_overs[-1]:
+            if batch.game_overs()[-1]:
                 R = 0
             else:
-                R = self.networks['main'].online_network.predict(last_sample(next_states))[0]
+                R = self.networks['main'].online_network.predict(last_sample(batch.next_states(network_keys)))[0]
 
             for i in reversed(range(num_transitions)):
-                R = rewards[i] + self.ap.algorithm.discount * R
+                R = batch.rewards()[i] + self.ap.algorithm.discount * R
                 state_value_head_targets[i] = R
                 action_advantages[i] = R - current_state_values[i]
 
         elif self.policy_gradient_rescaler == PolicyGradientRescaler.CUSTOM_ACTOR_CRITIC:
-            if game_overs[-1]:
+            if batch.game_overs()[-1]:
                 R = 0
             else:
-                R = self.get_value_for_states(last_sample(next_states))
+                R = self.get_value_for_states(last_sample(batch.next_states(network_keys)))
 
             for i in reversed(range(num_transitions)):
-                R = rewards[i] + self.ap.algorithm.discount * R
+                R = batch.rewards()[i] + self.ap.algorithm.discount * R
                 state_value_head_targets[i] = R
                 action_advantages[i] = R - current_state_values[i]
 
         elif self.policy_gradient_rescaler == PolicyGradientRescaler.GAE:
             # get bootstraps
-            bootstrapped_value = self.networks['main'].online_network.predict(last_sample(next_states))[0]
+            bootstrapped_value = self.networks['main'].online_network.predict(last_sample(batch.next_states(network_keys)))[0]
             values = np.append(current_state_values, bootstrapped_value)
-            if game_overs[-1]:
+            if batch.game_overs()[-1]:
                 values[-1] = 0
 
             # get general discounted returns table
-            gae_values, state_value_head_targets = self.get_general_advantage_estimation_values(rewards, values)
+            gae_values, state_value_head_targets = self.get_general_advantage_estimation_values(batch.rewards(), values)
             action_advantages = np.vstack(gae_values)
         else:
             screen.warning("WARNING: The requested policy gradient rescaler is not available")
 
         action_advantages = action_advantages.squeeze(axis=-1)
-        if not isinstance(self.spaces.action, Discrete) and len(actions.shape) < 2:
+        actions = batch.actions()
+        if not isinstance(self.spaces.action, DiscreteActionSpace) and len(actions.shape) < 2:
             actions = np.expand_dims(actions, -1)
 
         # train
-        result = self.networks['main'].online_network.accumulate_gradients({**current_states, 'output_1_0': actions},
+        result = self.networks['main'].online_network.accumulate_gradients({**batch.states(network_keys),
+                                                                            'output_1_0': actions},
                                                                        [state_value_head_targets, action_advantages])
 
         # logging
@@ -187,30 +191,6 @@ class ActorCriticAgent(PolicyOptimizationAgent):
 
         return total_loss, losses, unclipped_grads
 
-    def choose_action(self, curr_state):
-        # TODO: shouldn't this be inherited?
-        # convert to batch so we can run it through the network
-        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'main')
-        if isinstance(self.spaces.action, Discrete):
-            # DISCRETE
-            state_value, action_probabilities = self.networks['main'].online_network.predict(tf_input_state)
-            action_probabilities = action_probabilities.squeeze()
-            action = self.exploration_policy.get_action(action_probabilities)
-            action_info = ActionInfo(action=action,
-                                     action_probability=action_probabilities[action],
-                                     state_value=state_value)
-
-            self.entropy.add_sample(-np.sum(action_probabilities * np.log(action_probabilities + eps)))
-        elif isinstance(self.spaces.action, Box):
-            # CONTINUOUS
-            result = self.networks['main'].online_network.predict(tf_input_state)
-            state_value = result[0]
-            action_values = result[1:]
-
-            action = self.exploration_policy.get_action(action_values)
-
-            action_info = ActionInfo(action=action, state_value=state_value)
-        else:
-            raise ValueError("The action space of the environment is not compatible with the algorithm")
-
-        return action_info
+    def get_prediction(self, states):
+        tf_input_state = self.prepare_batch_for_inference(states, "main")
+        return self.networks['main'].online_network.predict(tf_input_state)[1:]  # index 0 is the state value

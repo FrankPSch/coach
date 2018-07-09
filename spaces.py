@@ -1,8 +1,30 @@
-import numpy as np
-from core_types import ActionType, GoalTypes, ActionInfo
-from typing import Union, List, Dict
-from itertools import product
+#
+# Copyright (c) 2017 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 import random
+from enum import Enum
+from itertools import product
+from typing import Union, List, Dict, Tuple
+
+import numpy as np
+import scipy
+import scipy.spatial
+
+from core_types import ActionType, GoalTypes, ActionInfo
+from utils import eps
 
 
 class Space(object):
@@ -26,6 +48,7 @@ class Space(object):
         # it will be set in the shape setter
         self.num_elements = 0
 
+        self._low = self._high = None
         self._shape = self.shape = shape
         self._low = self.low = low
         self._high = self.high = high
@@ -140,11 +163,17 @@ class ObservationSpace(Space):
         super().__init__(shape, low, high)
 
 
-class MeasurementsObservationSpace(ObservationSpace):
+class VectorObservationSpace(ObservationSpace):
     def __init__(self, shape: int, low: Union[None, int, float, np.ndarray]=-np.inf,
-                 high: Union[None, int, float, np.ndarray]=np.inf):
-        super().__init__(shape, low, high)
+                 high: Union[None, int, float, np.ndarray]=np.inf, measurements_names: List[str]=None):
+        if measurements_names is None:
+            measurements_names = []
+        if len(measurements_names) > shape:
+            raise ValueError("measurement_names size {} is larger than shape {}.".format(
+                len(measurements_names), shape))
 
+        self.measurements_names = measurements_names
+        super().__init__(shape, low, high)
 
 
 class PlanarMapsObservationSpace(ObservationSpace):
@@ -168,7 +197,6 @@ class ImageObservationSpace(PlanarMapsObservationSpace):
         self.has_colors = self.channels == 3
         if not self.channels == 3 and not self.channels == 1:
             raise ValueError("Image observations must have 1 or 3 channels, not {}".format(self.channels))
-
 
 
 # TODO: mixed observation spaces (image + measurements, image + segmentation + depth map, etc.)
@@ -233,8 +261,11 @@ class ActionSpace(Space):
     def __str__(self):
         return "{}: shape = {}, low = {}, high = {}".format(self.__class__.__name__, self.shape, self.low, self.high)
 
+    def __repr__(self):
+        return self.__str__()
 
-class Attention(ActionSpace):
+
+class AttentionActionSpace(ActionSpace):
     """
     A box selection continuous action space, meaning that the actions are defined as selecting a multidimensional box
     from a given range.
@@ -278,7 +309,7 @@ class Attention(ActionSpace):
         return action
 
 
-class Box(ActionSpace):
+class BoxActionSpace(ActionSpace):
     """
     A multidimensional bounded or unbounded continuous action space
     """
@@ -295,14 +326,18 @@ class Box(ActionSpace):
             self.default_action = default_action
 
     def sample(self) -> np.ndarray:
-        return np.random.uniform(self.low, self.high, self.shape)
+        # if there are infinite bounds, we sample using gaussian noise with mean 0 and std 1
+        if np.any(self.low == -np.inf) or np.any(self.high == np.inf):
+            return np.random.normal(0, 1, self.shape)
+        else:
+            return np.random.uniform(self.low, self.high, self.shape)
 
     def clip_action_to_space(self, action: ActionType) -> ActionType:
         action = np.clip(action, self.low, self.high)
         return action
 
 
-class Discrete(ActionSpace):
+class DiscreteActionSpace(ActionSpace):
     """
     A discrete action space with action indices as actions
     """
@@ -337,7 +372,7 @@ class Discrete(ActionSpace):
             raise ValueError("The given action is outside of the action space")
 
 
-class MultiSelect(ActionSpace):
+class MultiSelectActionSpace(ActionSpace):
     """
     A discrete action space where multiple actions can be selected at once. The actions are encoded as multi-hot vectors
     """
@@ -384,21 +419,170 @@ class MultiSelect(ActionSpace):
         return ' + '.join(description)
 
 
-class Goals(Box):
+class CompoundActionSpace(ActionSpace):
+    """
+    An action space which consists of multiple sub-action spaces.
+    For example, in Starcraft the agent should choose an action identifier from ~550 options (Discrete(550)),
+    but it also needs to choose 13 different arguments for the selected action identifier, where each argument is
+    by itself an action space. In Starcraft, the arguments are Discrete action spaces as well, but this is not mandatory.
+    """
+    def __init__(self, sub_spaces: List[ActionSpace]):
+        super().__init__(0)
+        self.sub_action_spaces = sub_spaces
+        # TODO: we must define the shape, low and high in a better way
+
+    @property
+    def actions(self) -> List[ActionType]:
+        return [action_space.actions for action_space in self.sub_action_spaces]
+
+    def sample(self) -> ActionType:
+        return [action_space.sample() for action_space in self.sub_action_spaces]
+
+    def clip_action_to_space(self, actions: List[ActionType]) -> ActionType:
+        if not isinstance(actions, list) or len(actions) != len(self.sub_action_spaces):
+            raise ValueError("The actions to be clipped must be a list with the same number of sub-actions as "
+                             "defined in the compound action space.")
+        for idx in range(len(self.sub_action_spaces)):
+            actions[idx] = self.sub_action_spaces[idx].clip_action_to_space(actions[idx])
+        return actions
+
+    def get_description(self, actions: np.ndarray) -> str:
+        description = [action_space.get_description(action) for action_space, action in zip(self.sub_action_spaces, actions)]
+        return ' + '.join(description)
+
+
+
+"""
+Goals
+"""
+
+class GoalToRewardConversion(object):
+    def __init__(self):
+        pass
+
+    def convert_distance_to_reward(self, distance: Union[float, np.ndarray]) -> Tuple[float, bool]:
+        """
+        Given a distance from the goal, return a reward and a flag representing if the goal was reached
+        :param distance: the distance from the goal
+        :return:
+        """
+        raise NotImplementedError("")
+
+
+class ReachingGoal(GoalToRewardConversion):
+    """
+    get a reward if the goal was reached and 0 otherwise
+    """
+    def __init__(self, distance_from_goal_threshold: Union[float, np.ndarray], goal_reaching_reward: float=0,
+                 default_reward: float=-1):
+        """
+        :param distance_from_goal_threshold: consider getting to this distance from the goal the same as getting
+                                             to the goal
+        :param goal_reaching_reward: the reward the agent will get when reaching the goal
+        :param default_reward: the reward the agent will get until it reaches the goal
+        """
+        super().__init__()
+        self.distance_from_goal_threshold = distance_from_goal_threshold
+        self.goal_reaching_reward = goal_reaching_reward
+        self.default_reward = default_reward
+
+    def convert_distance_to_reward(self, distance: Union[float, np.ndarray]) -> Tuple[float, bool]:
+        if np.all(distance <= self.distance_from_goal_threshold):
+            return self.goal_reaching_reward, True
+        else:
+            return self.default_reward, False
+
+
+class InverseDistanceFromGoal(GoalToRewardConversion):
+    """
+    get a reward inversely proportional to the distance from the goal
+    """
+    def __init__(self, distance_from_goal_threshold: Union[float, np.ndarray], max_reward: float=1):
+        """
+        :param distance_from_goal_threshold: consider getting to this distance from the goal the same as getting
+                                             to the goal
+        :param max_reward: the max reward the agent can get
+        """
+        super().__init__()
+        self.distance_from_goal_threshold = distance_from_goal_threshold
+        self.max_reward = max_reward
+
+    def convert_distance_to_reward(self, distance: Union[float, np.ndarray]) -> Tuple[float, bool]:
+        return min(self.max_reward, 1 / (distance + eps)), distance <= self.distance_from_goal_threshold
+
+
+class GoalsActionSpace(BoxActionSpace):
     """
     A multidimensional action space with a goal type definition
+    The class acts as a wrapper to the target space. So after setting the target space, all the values of the class
+    will match the values of the target space (the shape, low, high, etc.)
     """
-    def __init__(self, shape: Union[int, np.ndarray], goal_type: GoalTypes,
-                 low: Union[None, int, float, np.ndarray]=-np.inf, high: Union[None, int, float, np.ndarray]=np.inf):
-        super().__init__(shape, low, high)
+    class DistanceMetric(Enum):
+        Euclidean = 0
+        Cosine = 1
+        Manhattan = 2
+
+    def __init__(self, goal_type: str, reward_type: GoalToRewardConversion, distance_metric: DistanceMetric):
+        """
+        :param goal_type: the name of the observation space to use as goals.
+        :param reward_type: the reward type to use for converting distances from goal to rewards
+        :param distance_metric: the distance metric to use. could be either one of the distances in the
+                                DistanceMetric enum, or a custom function that gets two vectors as input and
+                                returns the distance between them
+        """
+        super().__init__(0)
         self.goal_type = goal_type
-        # TODO: use the goal type
+        self.distance_metric = distance_metric
+        self.reward_type = reward_type
+        self.target_space = None
 
-    def sample(self):
-        return np.random.randn(self.shape)
+    def set_target_space(self, target_space: Space) -> None:
+        self.target_space = target_space
+        super().__init__(self.target_space.shape, self.target_space.low, self.target_space.high)
+
+    def goal_from_state(self, state: Dict):
+        """
+        Given a state, extract an observation according to the goal_type
+        :param state: a dictionary of observations
+        :return: the observation corresponding to the goal_type
+        """
+        return state[self.goal_type]
+
+    def distance_from_goal(self, goal: np.ndarray, state: dict) -> float:
+        """
+        Given a state, check its distance from the goal
+        :param goal: a numpy array representing the goal
+        :param state: a dict representing the state
+        :return: the distance from the goal
+        """
+        state_value = self.goal_from_state(state)
+
+        # calculate distance
+        if self.distance_metric == self.DistanceMetric.Cosine:
+            dist = scipy.spatial.distance.cosine(goal, state_value)
+        elif self.distance_metric == self.DistanceMetric.Euclidean:
+            dist = scipy.spatial.distance.euclidean(goal, state_value)
+        elif self.distance_metric == self.DistanceMetric.Manhattan:
+            dist = scipy.spatial.distance.cityblock(goal, state_value)
+        elif callable(self.distance_metric):
+            dist = self.distance_metric(goal, state_value)
+        else:
+            raise ValueError("The given distance metric for the goal is not valid.")
+
+        return dist
+
+    def get_reward_for_goal_and_state(self, goal: np.ndarray, state: dict) -> Tuple[float, bool]:
+        """
+        Given a state, check if the goal was reached and return a reward accordingly
+        :param goal: a numpy array representing the goal
+        :param state: a dict representing the state
+        :return: the reward for the current goal and state pair and a boolean representing if the goal was reached
+        """
+        dist = self.distance_from_goal(goal, state)
+        return self.reward_type.convert_distance_to_reward(dist)
 
 
-class AgentSelection(Discrete):
+class AgentSelection(DiscreteActionSpace):
     """
     An discrete action space which is bounded by the number of agents to select from
     """

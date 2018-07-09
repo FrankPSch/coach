@@ -14,50 +14,23 @@
 # limitations under the License.
 #
 
-import json
+import importlib
+import importlib.util
 import inspect
+import json
 import os
+import signal
+import threading
+import time
+from subprocess import Popen
+from typing import List, Tuple
 
 import numpy as np
-import threading
-from subprocess import call, Popen
-import signal
-from typing import List
-import importlib
-
-import time
+from multiprocessing import Manager
 
 killed_processes = []
 
 eps = np.finfo(np.float32).eps
-
-
-class Enum(object):
-    def __init__(self):
-        pass
-
-    def keys(self):
-        return [attr.lower() for attr in dir(self) if not callable(getattr(self, attr)) and not attr.startswith("__")]
-
-    def vals(self):
-        vars = dict(inspect.getmembers(self, lambda a: not (inspect.isroutine(a))))
-        return {key.lower(): vars[key] for key in vars}
-
-    def get(self, string):
-        if string.lower() in self.keys():
-            return self.vals()[string.lower()]
-        raise NameError('enum does not exist')
-
-    def verify(self, string):
-        if string.lower() in self.keys():
-            return string.lower(), self.vals()[string.lower()]
-        raise NameError('enum does not exist')
-
-    def to_string(self, enum):
-        for key, val in self.vals().items():
-            if val == enum:
-                return key
-        raise NameError('enum does not exist')
 
 
 def lower_under_to_upper(s):
@@ -414,7 +387,22 @@ def short_dynamic_import(module_path_and_attribute: str, ignore_module_case: boo
                                       an attribute name to import from the path
     :return: the requested attribute
     """
-    return dynamic_import(*module_path_and_attribute.split(':'), ignore_module_case=ignore_module_case)
+    if '/' in module_path_and_attribute:
+        """
+        Imports a class from a module using the full path of the module. The path should be given as:
+        <full absolute module path with / including .py>:<class name to import>
+        And this will be the same as doing "from <full absolute module path> import <class name to import>"
+        """
+        return dynamic_import_from_full_path(*module_path_and_attribute.split(':'),
+                                             ignore_module_case=ignore_module_case)
+    else:
+        """
+        Imports a class from a module using the relative path of the module. The path should be given as:
+        <full absolute module path with . and not including .py>:<class name to import>
+        And this will be the same as doing "from <full relative module path> import <class name to import>"
+        """
+        return dynamic_import(*module_path_and_attribute.split(':'),
+                              ignore_module_case=ignore_module_case)
 
 
 def dynamic_import(module_path: str, class_name: str, ignore_module_case: bool=False):
@@ -431,7 +419,25 @@ def dynamic_import(module_path: str, class_name: str, ignore_module_case: bool=F
     return class_ref
 
 
-def dynamic_import_and_instantiate_module_from_params(module_parameters, path=None, positional_args=[]):
+def dynamic_import_from_full_path(module_path: str, class_name: str, ignore_module_case: bool=False):
+    if ignore_module_case:
+        module_name = module_path.split("/")[-1]
+        available_modules = os.listdir(os.path.dirname(module_path))
+        for module in available_modules:
+            curr_module_ext = module.split('.')[-1].lower()
+            curr_module_name = module.split('.')[0]
+            if curr_module_ext == "py" and curr_module_name.lower() == module_name.lower():
+                module_path = '.'.join(module_path.split("/")[:-1] + [curr_module_name])
+
+    spec = importlib.util.spec_from_file_location("module", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    class_ref = getattr(module, class_name)
+    return class_ref
+
+
+def dynamic_import_and_instantiate_module_from_params(module_parameters, path=None, positional_args=[],
+                                                      extra_kwargs={}):
     """
     A function dedicated for coach modules like memory, exploration policy, etc.
     Given the module parameters, it imports it and instantiates it.
@@ -444,6 +450,7 @@ def dynamic_import_and_instantiate_module_from_params(module_parameters, path=No
     module = short_dynamic_import(path)
     args = set(inspect.getfullargspec(module).args).intersection(module_parameters.__dict__)
     args = {k: module_parameters.__dict__[k] for k in args}
+    args = {**args, **extra_kwargs}
     return short_dynamic_import(path)(*positional_args, **args)
 
 
@@ -487,6 +494,11 @@ class SharedMemoryScratchPad(object):
             return None
         return self.dict[key]
 
+    def internal_call(self, key, func, args: Tuple):
+        if type(args) != tuple:
+            args = (args,)
+        return getattr(self.dict[key], func)(*args)
+
 
 class Timer(object):
     def __init__(self, prefix):
@@ -497,3 +509,40 @@ class Timer(object):
 
     def __exit__(self, type, value, traceback):
         print(self.prefix, time.time() - self.start)
+
+
+class ReaderWriterLock(object):
+    def __init__(self):
+        self.num_readers_lock = Manager().Lock()
+        self.writers_lock = Manager().Lock()
+        self.num_readers = 0
+        self.now_writing = False
+
+    def some_worker_is_reading(self):
+        return self.num_readers > 0
+
+    def some_worker_is_writing(self):
+        return self.now_writing is True
+
+    def lock_writing_and_reading(self):
+        self.writers_lock.acquire()  # first things first - block all other writers
+        self.now_writing = True  # block new readers who haven't started reading yet
+        while self.some_worker_is_reading():  # let existing readers finish their homework
+            time.sleep(0.05)
+
+    def release_writing_and_reading(self):
+        self.now_writing = False  # release readers - guarantee no readers starvation
+        self.writers_lock.release()  # release writers
+
+    def lock_writing(self):
+        while self.now_writing:
+            time.sleep(0.05)
+
+        self.num_readers_lock.acquire()
+        self.num_readers += 1
+        self.num_readers_lock.release()
+
+    def release_writing(self):
+        self.num_readers_lock.acquire()
+        self.num_readers -= 1
+        self.num_readers_lock.release()

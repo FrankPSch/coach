@@ -1,15 +1,33 @@
-from filters.action.partial_discrete_action_space_map import PartialDiscreteActionSpaceMap
-from spaces import Box, ActionSpace, Discrete
-from typing import Union, List
-import numpy as np
+#
+# Copyright (c) 2017 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 from itertools import product
+from typing import Union, List
+
+import numpy as np
+
+from filters.action.partial_discrete_action_space_map import PartialDiscreteActionSpaceMap
+from spaces import BoxActionSpace, DiscreteActionSpace
 
 
 class BoxDiscretization(PartialDiscreteActionSpaceMap):
     """
     Given a box action space, this is used to discretize the space.
     The discretization is achieved by creating a grid in the space with num_bins_per_dimension bins per dimension in the
-    space. Each discrete action is mapped to a single N dimensional action in the Box action space.
+    space. Each discrete action is mapped to a single N dimensional action in the BoxActionSpace action space.
     """
     def __init__(self, num_bins_per_dimension: Union[int, List[int]], force_int_bins=False):
         """
@@ -25,9 +43,9 @@ class BoxDiscretization(PartialDiscreteActionSpaceMap):
         self.force_int_bins = force_int_bins
         super().__init__()
 
-    def validate_output_action_space(self, output_action_space: Box):
-        if not isinstance(output_action_space, Box):
-            raise ValueError("Box discretization only works with an output space of type Box. "
+    def validate_output_action_space(self, output_action_space: BoxActionSpace):
+        if not isinstance(output_action_space, BoxActionSpace):
+            raise ValueError("BoxActionSpace discretization only works with an output space of type BoxActionSpace. "
                              "The given output space is {}".format(output_action_space))
 
         if len(self.num_bins_per_dimension) != output_action_space.shape:
@@ -36,7 +54,7 @@ class BoxDiscretization(PartialDiscreteActionSpaceMap):
                              "dimensions in the action space ({})"
                              .format(len(self.num_bins_per_dimension), output_action_space))
 
-    def get_unfiltered_action_space(self, output_action_space: Box) -> Discrete:
+    def get_unfiltered_action_space(self, output_action_space: BoxActionSpace) -> DiscreteActionSpace:
         if isinstance(self.num_bins_per_dimension, int):
             self.num_bins_per_dimension = np.ones(output_action_space.shape) * self.num_bins_per_dimension
 

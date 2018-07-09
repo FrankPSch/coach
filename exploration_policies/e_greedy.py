@@ -14,13 +14,17 @@
 # limitations under the License.
 #
 
+from typing import List
+
+import numpy as np
+
+from core_types import RunPhase, ActionType
+from exploration_policies.additive_noise import AdditiveNoiseParameters
+from exploration_policies.exploration_policy import ExplorationParameters
 from exploration_policies.exploration_policy import ExplorationPolicy
 from schedules import Schedule, LinearSchedule
-from spaces import ActionSpace, Discrete, Box
-import numpy as np
-from core_types import RunPhase, ActionType
-from typing import List
-from exploration_policies.exploration_policy import ExplorationParameters
+from spaces import ActionSpace, DiscreteActionSpace, BoxActionSpace
+from utils import dynamic_import_and_instantiate_module_from_params
 
 
 class EGreedyParameters(ExplorationParameters):
@@ -28,7 +32,9 @@ class EGreedyParameters(ExplorationParameters):
         super().__init__()
         self.epsilon_schedule = LinearSchedule(0.5, 0.01, 50000)
         self.evaluation_epsilon = 0.05
-        self.noise_percentage_schedule = LinearSchedule(0.1, 0.1, 50000) # for continuous control -
+        self.continuous_exploration_policy_parameters = AdditiveNoiseParameters()
+        self.continuous_exploration_policy_parameters.noise_percentage_schedule = LinearSchedule(0.1, 0.1, 50000)
+        # for continuous control -
         # (see http://www.cs.ubc.ca/~van/papers/2017-TOG-deepLoco/2017-TOG-deepLoco.pdf)
 
     @property
@@ -38,39 +44,59 @@ class EGreedyParameters(ExplorationParameters):
 
 class EGreedy(ExplorationPolicy):
     def __init__(self, action_space: ActionSpace, epsilon_schedule: Schedule,
-                 evaluation_epsilon: float, noise_percentage_schedule: Schedule=None):
+                 evaluation_epsilon: float,
+                 continuous_exploration_policy_parameters: ExplorationParameters=AdditiveNoiseParameters()):
         """
         :param action_space: the action space used by the environment
         :param epsilon_schedule: a schedule for the epsilon values
         :param evaluation_epsilon: the epsilon value to use for evaluation phases
-        :param noise_percentage_schedule: a schedule for the noise percentage values
+        :param continuous_exploration_policy_parameters: the parameters of the continuous exploration policy to use
+                                                         if the e-greedy is used for a continuous policy
         """
-        ExplorationPolicy.__init__(self, action_space)
+        super().__init__(action_space)
         self.epsilon_schedule = epsilon_schedule
         self.evaluation_epsilon = evaluation_epsilon
-        # for continuous e-greedy (see http://www.cs.ubc.ca/~van/papers/2017-TOG-deepLoco/2017-TOG-deepLoco.pdf)
-        self.variance_schedule = noise_percentage_schedule
 
-        if type(action_space) == Box and noise_percentage_schedule is None:
-            raise ValueError("For continuous controls, the noise schedule should be supplied to the exploration policy")
+        if isinstance(self.action_space, BoxActionSpace):
+            # for continuous e-greedy (see http://www.cs.ubc.ca/~van/papers/2017-TOG-deepLoco/2017-TOG-deepLoco.pdf)
+            continuous_exploration_policy_parameters.action_space = action_space
+            self.continuous_exploration_policy = \
+                dynamic_import_and_instantiate_module_from_params(continuous_exploration_policy_parameters)
+
+        self.current_random_value = np.random.rand()
+
+    def requires_action_values(self):
+        epsilon = self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value
+        return self.current_random_value >= epsilon
 
     def get_action(self, action_values: List[ActionType]) -> ActionType:
-        if self.phase == RunPhase.TRAIN:
-            self.epsilon_schedule.step()
-            if self.variance_schedule:
-                self.variance_schedule.step()
         epsilon = self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value
 
-        if isinstance(self.action_space, Discrete):
+        if isinstance(self.action_space, DiscreteActionSpace):
             top_action = np.argmax(action_values)
-            if np.random.rand() < epsilon:
-                return self.action_space.sample()
+            if self.current_random_value < epsilon:
+                chosen_action = self.action_space.sample()
             else:
-                return top_action
+                chosen_action = top_action
         else:
-            noise = np.random.randn(1, self.action_space.shape) * self.variance_schedule.current_value * \
-                    self.action_space.max_abs_range
-            return np.squeeze(action_values + (np.random.rand() < epsilon) * noise)
+            if self.current_random_value < epsilon and self.phase == RunPhase.TRAIN:
+                chosen_action = self.action_space.sample()
+            else:
+                chosen_action = self.continuous_exploration_policy.get_action(action_values)
+
+        # step the epsilon schedule and generate a new random value for next time
+        if self.phase == RunPhase.TRAIN:
+            self.epsilon_schedule.step()
+        self.current_random_value = np.random.rand()
+        return chosen_action
 
     def get_control_param(self):
-        return self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value
+        if isinstance(self.action_space, DiscreteActionSpace):
+            return self.evaluation_epsilon if self.phase == RunPhase.TEST else self.epsilon_schedule.current_value
+        elif isinstance(self.action_space, BoxActionSpace):
+            return self.continuous_exploration_policy.get_control_param()
+
+    def change_phase(self, phase):
+        super().change_phase(phase)
+        if isinstance(self.action_space, BoxActionSpace):
+            self.continuous_exploration_policy.change_phase(phase)

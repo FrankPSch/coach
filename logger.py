@@ -14,17 +14,17 @@
 # limitations under the License.
 #
 import atexit
-from pandas import DataFrame
-import os
-from subprocess import Popen, PIPE
-import time
 import datetime
-from six.moves import input
-from PIL import Image
-import shutil
+import os
 import re
+import shutil
+import time
+from subprocess import Popen, PIPE
 from typing import Union
-import json
+
+from PIL import Image
+from pandas import DataFrame
+from six.moves import input
 
 global failed_imports
 failed_imports = []
@@ -200,7 +200,7 @@ class EpisodeLogger(BaseLogger):
 
         # set file names
         if task_id is not None:
-            filename += "block_{}.".format(task_id)
+            filename += "worker_{}.".format(task_id)
 
         # add timestamp
         if add_timestamp:
@@ -227,7 +227,7 @@ class Logger(BaseLogger):
 
         # set file names
         if task_id is not None:
-            filename += "block_{}.".format(task_id)
+            filename += "worker_{}.".format(task_id)
 
         # add timestamp
         if add_timestamp:

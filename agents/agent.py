@@ -14,32 +14,25 @@
 # limitations under the License.
 #
 
-try:
-    import matplotlib.pyplot as plt
-except:
-    from logger import failed_imports
-    failed_imports.append("matplotlib")
-
-from utils import Signal, RunningStat, squeeze_list, force_list
-from core_types import RunPhase, PredictionType, Episodes
-from configurations import MiddlewareTypes
-
 import copy
-import numpy as np
-from spaces import SpacesDefinition
-from logger import screen, Logger, EpisodeLogger
 import random
-from six.moves import range
-from agents.agent_interface import AgentInterface
-from core_types import Transition, ActionInfo, TrainingSteps, EnvironmentSteps, EnvResponse
-from utils import dynamic_import_and_instantiate_module_from_params, call_method_for_all
 from collections import OrderedDict
-from pandas import read_pickle
-from configurations import AgentParameters
 from typing import Dict, List, Union, Tuple
+
+import numpy as np
+from pandas import read_pickle
+from six.moves import range
+
+from agents.agent_interface import AgentInterface
 from architectures.network_wrapper import NetworkWrapper
-from block_factories.block_factory import DistributedTaskParameters
-from memories.episodic_experience_replay import EpisodicExperienceReplay
+from base_parameters import AgentParameters, DistributedTaskParameters
+from core_types import RunPhase, PredictionType, EnvironmentEpisodes, ActionType, Batch, Episode, StateType
+from core_types import Transition, ActionInfo, TrainingSteps, EnvironmentSteps, EnvResponse
+from logger import screen, Logger, EpisodeLogger
+from memories.episodic_experience_replay import EpisodicExperienceReplay, EpisodicExperienceReplayParameters
+from spaces import SpacesDefinition, VectorObservationSpace, GoalsActionSpace, AttentionActionSpace
+from utils import Signal, force_list
+from utils import dynamic_import_and_instantiate_module_from_params
 
 
 class Agent(AgentInterface):
@@ -51,14 +44,13 @@ class Agent(AgentInterface):
         self.ap = agent_parameters
         self.task_id = self.ap.task_parameters.task_index
         self.is_chief = self.task_id == 0
-        if self.ap.memory.distributed_memory:
+        self.shared_memory = type(agent_parameters.task_parameters) == DistributedTaskParameters \
+                             and self.ap.memory.shared_memory
+        if self.shared_memory:
             self.shared_memory_scratchpad = self.ap.task_parameters.shared_memory_scratchpad
         self.name = agent_parameters.name
         self.parent = parent
         self.parent_level_manager = None
-        # self.full_name_id = agent_parameters.full_name_id = '/'.join([#self.parent.parent_level_manager.name,
-        #                                                               #self.parent.name,
-        #                                                               self.name])
         self.full_name_id = agent_parameters.full_name_id = self.name
 
         if type(agent_parameters.task_parameters) == DistributedTaskParameters:
@@ -72,13 +64,17 @@ class Agent(AgentInterface):
 
         # i/o dimensions
         # TODO: update everyone that uses  desired_observation_width, action_space_size and measurements_size
-        # + update the measurements_size if use_accumulated_reward_as_measurement is used
 
+        # get the memory
+        # - distributed training + shared memory:
+        #   * is chief?  -> create the memory and add it to the scratchpad
+        #   * not chief? -> wait for the chief to create the memory and then fetch it
+        # - non distributed training / not shared memory:
+        #   * create memory
         memory_name = self.ap.memory.path.split(':')[1]
-        lookup_name = self.full_name_id + '.' + memory_name
-        if self.ap.memory.distributed_memory is True and not self.is_chief:
-            self.memory = self.shared_memory_scratchpad.get(lookup_name)
-            # print("agent {} just got a {} from the memory scratchpad".format(self.task_id, memory_name))
+        self.memory_lookup_name = self.full_name_id + '.' + memory_name
+        if self.shared_memory and not self.is_chief:
+            self.memory = self.shared_memory_scratchpad.get(self.memory_lookup_name)
         else:
             # modules
             if agent_parameters.memory.load_memory_from_file_path:
@@ -88,25 +84,32 @@ class Agent(AgentInterface):
             else:
                 self.memory = dynamic_import_and_instantiate_module_from_params(self.ap.memory)
 
-            if self.ap.memory.distributed_memory is True and self.is_chief:
-                self.shared_memory_scratchpad.add(lookup_name, self.memory)
-                # print("agent {} just pushed a {} to the memory scratchpad".format(self.task_id, memory_name))
+            if self.shared_memory and self.is_chief:
+                self.shared_memory_scratchpad.add(self.memory_lookup_name, self.memory)
 
+        # set devices
         if type(agent_parameters.task_parameters) == DistributedTaskParameters:
             self.has_global = True
             self.replicated_device = agent_parameters.task_parameters.device
-            self.worker_device = "/job:worker/task:{}/cpu:0".format(self.task_id)
+            self.worker_device = "/job:worker/task:{}".format(self.task_id)
         else:
             self.has_global = False
             self.replicated_device = None
-            self.worker_device = "/gpu:0"
+            self.worker_device = ""
+        if agent_parameters.task_parameters.use_cpu:
+            self.worker_device += "/cpu:0"
+        else:
+            self.worker_device += "/device:GPU:0"
 
         # filters
         self.input_filter = self.ap.input_filter
         self.output_filter = self.ap.output_filter
+        self.pre_network_filter = self.ap.pre_network_filter
         device = self.replicated_device if self.replicated_device else self.worker_device
         self.input_filter.set_device(device)
         self.output_filter.set_device(device)
+        self.pre_network_filter.set_device(device)
+
 
         # initialize all internal variables
         self._phase = RunPhase.HEATUP
@@ -119,6 +122,7 @@ class Agent(AgentInterface):
         self.last_training_phase_step = 0
         self.current_episode = self.ap.current_episode = 0
         self.curr_state = {}
+        self.current_goal = None
         self.current_episode_steps_counter = 0
         self.episode_running_info = {}
         self.last_episode_evaluation_ran = 0
@@ -129,10 +133,18 @@ class Agent(AgentInterface):
         self.last_action_info = None
         self.running_observation_stats = None
         self.running_reward_stats = None
+        self.accumulated_rewards_across_evaluation_episodes = 0
+        self.accumulated_shaped_rewards_across_evaluation_episodes = 0
+        self.num_successes_across_evaluation_episodes = 0
+        self.num_evaluation_episodes_completed = 0
+        self.current_episode_buffer = Episode(discount=self.ap.algorithm.discount)
         # TODO: add observations rendering from master
 
         # environment parameters
         self.spaces = None
+        self.in_action_space = self.ap.algorithm.in_action_space
+        if isinstance(self.in_action_space, GoalsActionSpace):
+            self.goals_action_space = self.in_action_space
 
         # signals
         self.episode_signals = []
@@ -142,6 +154,8 @@ class Agent(AgentInterface):
         self.unclipped_grads = self.register_signal('Grads (unclipped)')
         self.reward = self.register_signal('Reward', dump_one_value_per_episode=False, dump_one_value_per_step=True)
         self.shaped_reward = self.register_signal('Shaped Reward', dump_one_value_per_episode=False, dump_one_value_per_step=True)
+        if hasattr(self, 'goals_action_space'):
+            self.distance_from_goal = self.register_signal('Distance From Goal', dump_one_value_per_step=True)
 
         # TODO - reenable this
         # if self.ap.env.check_successes:
@@ -153,11 +167,33 @@ class Agent(AgentInterface):
             random.seed(self.ap.task_parameters.seed)
             np.random.seed(self.ap.task_parameters.seed)
 
+    @property
+    def parent(self):
+        """
+        Get the parent class of the agent
+        :return: the current phase
+        """
+        return self._parent
+
+    @parent.setter
+    def parent(self, val):
+        """
+        Change the parent class of the agent.
+        Additionally, updates the full name of the agent
+        :param val: the new parent
+        :return: None
+        """
+        self._parent = val
+        if self._parent is not None:
+            if not hasattr(self._parent, 'name'):
+                raise ValueError("The parent of an agent must have a name")
+            self.full_name_id = self.ap.full_name_id = "{}/{}".format(self._parent.name, self.name)
+
     def setup_logger(self):
         # TODO: this is ugly. we should do it nicer.
         # dump documentation
-        logger_prefix = "{block_name}.{level_name}.{agent_full_id}".\
-            format(block_name=self.parent_level_manager.parent_block_scheduler.name,
+        logger_prefix = "{graph_name}.{level_name}.{agent_full_id}".\
+            format(graph_name=self.parent_level_manager.parent_graph_manager.name,
                    level_name=self.parent_level_manager.name,
                    agent_full_id='.'.join(self.full_name_id.split('/')))
         self.agent_logger.set_logger_filenames(self.ap.task_parameters.experiment_path, logger_prefix=logger_prefix,
@@ -174,10 +210,18 @@ class Agent(AgentInterface):
         """
         self.input_filter.set_session(sess)
         self.output_filter.set_session(sess)
+        self.pre_network_filter.set_session(sess)
         [network.set_session(sess) for network in self.networks.values()]
 
     def register_signal(self, signal_name: str, dump_one_value_per_episode: bool=True,
                         dump_one_value_per_step: bool=False) -> Signal:
+        """
+        Register a signal such that its statistics will be dumped and be viewable through dashboard
+        :param signal_name: the name of the signal as it will appear in dashboard
+        :param dump_one_value_per_episode: should the signal value be written for each episode?
+        :param dump_one_value_per_step: should the signal value be written for each step?
+        :return: the created signal
+        """
         signal = Signal(signal_name)
         if dump_one_value_per_episode:
             self.episode_signals.append(signal)
@@ -193,11 +237,30 @@ class Agent(AgentInterface):
         :return: None
         """
         self.spaces = copy.deepcopy(spaces)
+
+        if self.ap.algorithm.use_accumulated_reward_as_measurement:
+            if 'measurements' in self.spaces.state.sub_spaces:
+                self.spaces.state['measurements'].shape += 1
+                self.spaces.state['measurements'].measurements_names += ['accumulated_reward']
+            else:
+                self.spaces.state['measurements'] = VectorObservationSpace(1, measurements_names=['accumulated_reward'])
+
         for observation_name in self.spaces.state.sub_spaces.keys():
             self.spaces.state[observation_name] = \
-                self.input_filter.get_filtered_observation_space(observation_name, self.spaces.state[observation_name])
-        self.spaces.reward = self.input_filter.get_filtered_reward_space(self.spaces.reward)
+                self.pre_network_filter.get_filtered_observation_space(observation_name,
+                    self.input_filter.get_filtered_observation_space(observation_name,
+                                                                     self.spaces.state[observation_name]))
+
+        self.spaces.reward = self.pre_network_filter.get_filtered_reward_space(
+            self.input_filter.get_filtered_reward_space(self.spaces.reward))
+
         self.spaces.action = self.output_filter.get_unfiltered_action_space(self.spaces.action)
+
+        if isinstance(self.in_action_space, GoalsActionSpace):
+            # TODO: what if the goal type is an embedding / embedding change?
+            self.in_action_space.set_target_space(self.spaces.state[self.in_action_space.goal_type])
+            self.spaces.goal = self.in_action_space
+
         self.init_environment_dependent_modules()
 
     def create_networks(self) -> Dict[str, NetworkWrapper]:
@@ -242,12 +305,55 @@ class Agent(AgentInterface):
         :param phase: the new run phase (TRAIN, TEST, etc.)
         :return: None
         """
+        self.reset_evaluation_state(val)
         self._phase = val
         self.exploration_policy.change_phase(val)
+
+    def reset_evaluation_state(self, val: RunPhase) -> None:
+        starting_evaluation = (val == RunPhase.TEST)
+        ending_evaluation = (self.phase == RunPhase.TEST)
+
+        if starting_evaluation:
+            self.accumulated_rewards_across_evaluation_episodes = 0
+            self.accumulated_shaped_rewards_across_evaluation_episodes = 0
+            self.num_successes_across_evaluation_episodes = 0
+            self.num_evaluation_episodes_completed = 0
+        elif ending_evaluation:
+            # we write to the next episode, because it could be that the current episode was already written
+            # to disk and then we won't write it again
+            self.agent_logger.set_current_time(self.current_episode + 1)
+            self.agent_logger.create_signal_value(
+                'Evaluation Reward',
+                self.accumulated_rewards_across_evaluation_episodes / self.num_evaluation_episodes_completed)
+            self.agent_logger.create_signal_value(
+                'Shaped Evaluation Reward',
+                self.accumulated_shaped_rewards_across_evaluation_episodes / self.num_evaluation_episodes_completed)
+            # self.agent_logger.create_signal_value(
+            #     "Success rate",
+            #     self.num_successes_across_evaluation_episodes / self.num_evaluation_episodes_completed
+            # )
+
+    def call_memory(self, func, args=()):
+        """
+        This function is a wrapper to allow having the same calls for shared or unshared memories.
+        It should be used instead of calling the memory directly in order to allow different algorithms to work
+        both with a shared and a local memory.
+        :param func: the name of the memory function to call
+        :param args: the arguments to supply to the function
+        :return: the return value of the function
+        """
+        if self.shared_memory:
+            result = self.shared_memory_scratchpad.internal_call(self.memory_lookup_name, func, args)
+        else:
+            if type(args) != tuple:
+                args = (args,)
+            result = getattr(self.memory, func)(*args)
+        return result
 
     def log_to_screen(self):
         # log to screen
         log = OrderedDict()
+        log["Name"] = self.full_name_id
         if self.task_id is not None:
             log["Worker"] = self.task_id
         log["Episode"] = self.current_episode
@@ -266,8 +372,8 @@ class Agent(AgentInterface):
         self.agent_episode_logger.set_current_time(self.current_episode_steps_counter)
         self.agent_episode_logger.create_signal_value('Training Iter', self.training_iteration)
         self.agent_episode_logger.create_signal_value('In Heatup', int(self._phase == RunPhase.HEATUP))
-        self.agent_episode_logger.create_signal_value('ER #Transitions', self.memory.num_transitions())
-        self.agent_episode_logger.create_signal_value('ER #Episodes', self.memory.length())
+        self.agent_episode_logger.create_signal_value('ER #Transitions', self.call_memory('num_transitions'))
+        self.agent_episode_logger.create_signal_value('ER #Episodes', self.call_memory('length'))
         self.agent_episode_logger.create_signal_value('Total steps', self.total_steps_counter)
         self.agent_episode_logger.create_signal_value("Epsilon", self.exploration_policy.get_control_param())
         self.agent_episode_logger.create_signal_value("Shaped Accumulated Reward", self.total_shaped_reward_in_current_episode)
@@ -289,8 +395,8 @@ class Agent(AgentInterface):
         self.agent_logger.set_current_time(self.current_episode)
         self.agent_logger.create_signal_value('Training Iter', self.training_iteration)
         self.agent_logger.create_signal_value('In Heatup', int(self._phase == RunPhase.HEATUP))
-        self.agent_logger.create_signal_value('ER #Transitions', self.memory.num_transitions())
-        self.agent_logger.create_signal_value('ER #Episodes', self.memory.length())
+        self.agent_logger.create_signal_value('ER #Transitions', self.call_memory('num_transitions'))
+        self.agent_logger.create_signal_value('ER #Episodes', self.call_memory('length'))
         self.agent_logger.create_signal_value('Episode Length', self.current_episode_steps_counter)
         self.agent_logger.create_signal_value('Total steps', self.total_steps_counter)
         self.agent_logger.create_signal_value("Epsilon", np.mean(self.exploration_policy.get_control_param()))
@@ -299,11 +405,12 @@ class Agent(AgentInterface):
         self.agent_logger.create_signal_value("Training Reward", self.total_reward_in_current_episode
                                    if self._phase == RunPhase.TRAIN else np.nan)
         self.agent_logger.create_signal_value('Shaped Evaluation Reward', self.total_shaped_reward_in_current_episode
-                                   if self._phase == RunPhase.TEST else np.nan)
-        self.agent_logger.create_signal_value('Evaluation Reward', self.total_reward_in_current_episode
-                                   if self._phase == RunPhase.TEST else np.nan)
+                                   if self._phase == RunPhase.TEST else np.nan, overwrite=False)
         self.agent_logger.create_signal_value('Update Target Network', 0, overwrite=False)
         self.agent_logger.update_wall_clock_time(self.current_episode)
+
+        if self._phase != RunPhase.TEST:
+            self.agent_logger.create_signal_value('Evaluation Reward', np.nan, overwrite=False)
 
         for signal in self.episode_signals:
             self.agent_logger.create_signal_value("{}/Mean".format(signal.name), signal.get_mean())
@@ -316,19 +423,28 @@ class Agent(AgentInterface):
                 and self.current_episode > 0:
             self.agent_logger.dump_output_csv()
 
-    def end_episode(self) -> None:
+    def handle_episode_ended(self) -> None:
         """
         End an episode
         :return: None
         """
-        self.current_episode += 1
+        if self.phase != RunPhase.TEST or self.ap.task_parameters.evaluate_only:
+            self.current_episode += 1
+            if isinstance(self.memory, EpisodicExperienceReplay):
+                self.call_memory('store_episode', self.current_episode_buffer)
+
+        if self.phase == RunPhase.TEST:
+            self.accumulated_rewards_across_evaluation_episodes += self.total_reward_in_current_episode
+            self.accumulated_shaped_rewards_across_evaluation_episodes += self.total_shaped_reward_in_current_episode
+            self.num_evaluation_episodes_completed += 1
+
         if self.ap.visualization.dump_csv:
             self.update_log()
 
-        if self.ap.visualization.print_summary:
+        if self.ap.is_a_highest_level_agent or self.ap.task_parameters.verbosity == "high":
             self.log_to_screen()
 
-    def reset(self):
+    def reset_internal_state(self):
         """
         Reset all the episodic parameters
         :return: None
@@ -343,20 +459,17 @@ class Agent(AgentInterface):
         self.curr_state = {}
         self.current_episode_steps_counter = 0
         self.episode_running_info = {}
+        self.current_episode_buffer = Episode(discount=self.ap.algorithm.discount)
         if self.exploration_policy:
             self.exploration_policy.reset()
         self.input_filter.reset()
         self.output_filter.reset()
+        self.pre_network_filter.reset()
         if isinstance(self.memory, EpisodicExperienceReplay):
-            self.memory.verify_last_episode_is_closed()
+            self.call_memory('verify_last_episode_is_closed')
 
-        #TODO - this is broken, need to match network name in ap to the agent's networks (i.e. have dict instead of
-        #  list)
-        for network_wrapper in self.ap.network_wrappers.keys():
-            if self.ap.network_wrappers[network_wrapper].middleware_type == MiddlewareTypes.LSTM:
-                network = self.networks[network_wrapper]
-                network.online_network.curr_rnn_c_in = network.online_network.middleware_embedder.c_init
-                network.online_network.curr_rnn_h_in = network.online_network.middleware_embedder.h_init
+        for network in self.networks.values():
+            network.online_network.reset_internal_memory()
 
     def learn_from_batch(self, batch) -> Tuple[float, List, List]:
         """
@@ -372,7 +485,6 @@ class Agent(AgentInterface):
         :return: boolean: True if the online weights should be copied to the target.
         """
         # TODO: modify all the presets such that this parameter will be defined in this manner
-        # TODO: this shouldn't be called if there is no target network
         # TODO: allow specifying in frames
         # update the target network of every network that has a target network
         step_method = self.ap.algorithm.num_steps_between_copying_online_weights_to_target
@@ -395,7 +507,7 @@ class Agent(AgentInterface):
         :return:  boolean: True if we should start a training phase
         """
         step_method = self.ap.algorithm.num_consecutive_playing_steps
-        if step_method.__class__ == Episodes:
+        if step_method.__class__ == EnvironmentEpisodes:
             should_update = (self.current_episode - self.last_training_phase_step) >= step_method.num_steps
             if should_update:
                 self.last_training_phase_step = self.current_episode
@@ -427,12 +539,15 @@ class Agent(AgentInterface):
                 self.training_iteration += 1
 
                 # sample a batch and train on it
-                batch = self.memory.sample(network_parameters.batch_size)
+                batch = self.call_memory('sample', network_parameters.batch_size)
+                if self.pre_network_filter is not None:
+                    batch = self.pre_network_filter.filter(batch, update_internal_state=False, deep_copy=False)
 
                 # if the batch returned empty then there are not enough samples in the replay buffer -> skip
                 # training step
                 if len(batch) > 0:
                     # train
+                    batch = Batch(batch)
                     total_loss, losses, unclipped_grads = self.learn_from_batch(batch)
                     loss += total_loss
                     self.unclipped_grads.add_sample(unclipped_grads)
@@ -445,7 +560,8 @@ class Agent(AgentInterface):
                     else:
                         self.curr_learning_rate.add_sample(network_parameters.learning_rate)
 
-                    if self._should_update_online_weights_to_target():
+                    if any([network.has_target for network in self.networks.values()]) \
+                            and self._should_update_online_weights_to_target():
                         for network in self.networks.values():
                             network.update_target_network(self.ap.algorithm.rate_for_copying_weights_to_target)
 
@@ -463,32 +579,6 @@ class Agent(AgentInterface):
 
         return loss
 
-    def extract_batch(self, batch, network_name):
-        """
-        Extracts a single numpy array for each object in a batch of transitions (state, action, etc.)
-        :param batch: An array of transitions
-        :return: For each transition element, returns a numpy array of all the transitions in the batch
-        """
-
-        # extract current and next states
-        current_states = {}
-        next_states = {}
-        for key in self.ap.network_wrappers[network_name].input_types.keys():
-            current_states[key] = np.array([np.array(transition.state[key]) for transition in batch])
-            next_states[key] = np.array([np.array(transition.next_state[key]) for transition in batch])
-
-        # extract the rest of the data into batch structures
-        actions = np.array([transition.action for transition in batch])
-        rewards = np.array([transition.reward for transition in batch])
-        game_overs = np.array([transition.game_over for transition in batch])
-
-        # check if the total return is available
-        total_return = None
-        if batch[0]._total_return:
-            total_return = np.array([transition.total_return for transition in batch])
-
-        return current_states, next_states, actions, rewards, game_overs, total_return
-
     def choose_action(self, curr_state):
         """
         choose an action to act with in the current episode being played. Different behavior might be exhibited when training
@@ -499,17 +589,21 @@ class Agent(AgentInterface):
         """
         pass
 
-    def dict_state_to_batches_dict(self, curr_state: Union[Dict[str, np.ndarray], List[Dict[str, np.ndarray]]],
-                                   network_name: str):
+    def prepare_batch_for_inference(self, states: Union[Dict[str, np.ndarray], List[Dict[str, np.ndarray]]],
+                                    network_name: str):
         """
-        convert curr_state into input tensors tensorflow is expecting.
+        convert curr_state into input tensors tensorflow is expecting. i.e. if we have several inputs states, stack all
+        observations together, measurements together, etc.
         """
         # convert to batch so we can run it through the network
-        curr_states = force_list(curr_state)
+        states = force_list(states)
         batches_dict = {}
-        for key in self.ap.network_wrappers[network_name].input_types.keys():
-            if key in curr_states[0].keys():
-                batches_dict[key] = np.array([np.array(curr_state[key]) for curr_state in curr_states])
+        for key in self.ap.network_wrappers[network_name].input_embedders_parameters.keys():
+            # there are cases (e.g. ddpg) where the state does not contain all the information needed for running
+            # through the network and this has to be added externally (e.g. ddpg where the action needs to be given in
+            # addition to the current_state, so that all the inputs of the network will be filled)
+            if key in states[0].keys():
+                batches_dict[key] = np.array([np.array(state[key]) for state in states])
 
         return batches_dict
 
@@ -518,7 +612,6 @@ class Agent(AgentInterface):
         Given the agents current knowledge, decide on the next action to apply to the environment
         :return: an action and a dictionary containing any additional info from the action decision process
         """
-        # assert type(self.ap.algorithm.num_consecutive_playing_steps) == EnvironmentSteps
         if self.phase == RunPhase.TRAIN and self.ap.algorithm.num_consecutive_playing_steps.num_steps == 0:
             # This agent never plays  while training (e.g. behavioral cloning)
             return None
@@ -534,11 +627,20 @@ class Agent(AgentInterface):
             self.last_action_info = self.spaces.action.sample_with_info()
         else:
             # informed action
-            self.last_action_info = self.choose_action(self.curr_state)
+            if self.pre_network_filter is not None:
+                # before choosing an action, first use the pre_network_filter to filter out the current state
+                curr_state = self.run_pre_network_filter_for_inference(self.curr_state)
+            else:
+                curr_state = self.curr_state
+            self.last_action_info = self.choose_action(curr_state)
 
         filtered_action_info = self.output_filter.filter(self.last_action_info)
 
         return filtered_action_info
+
+    def run_pre_network_filter_for_inference(self, state: StateType):
+        dummy_env_response = EnvResponse(next_state=state, reward=0, game_over=False)
+        return self.pre_network_filter.filter(dummy_env_response)[0].next_state
 
     def get_state_embedding(self, state: dict) -> np.ndarray:
         """
@@ -549,9 +651,18 @@ class Agent(AgentInterface):
         # TODO: this won't work anymore
         # TODO: instead of the state embedding (which contains the goal) we should use the observation embedding
         embedding = self.networks['main'].online_network.predict(
-            self.dict_state_to_batches_dict(state, "main"),
+            self.prepare_batch_for_inference(state, "main"),
             outputs=self.networks['main'].online_network.state_embedding)
         return embedding
+
+    def update_transition_before_adding_to_replay_buffer(self, transition: Transition) -> Transition:
+        """
+        Allows agents to update the transition just before adding it to the replay buffer.
+        Can be useful for agents that want to tweak the reward, termination signal, etc.
+        :param transition: the transition to update
+        :return: the updated transition
+        """
+        return transition
 
     def observe(self, env_response: EnvResponse) -> bool:
         """
@@ -563,31 +674,54 @@ class Agent(AgentInterface):
         """
 
         # filter the env_response
-        filtered_env_response = self.input_filter.filter(env_response)
+        filtered_env_response = self.input_filter.filter(env_response)[0]
 
+        # inject agent collected statistics, if required
+        if self.ap.algorithm.use_accumulated_reward_as_measurement:
+            if 'measurements' in filtered_env_response.next_state:
+                filtered_env_response.next_state['measurements'] = np.append(filtered_env_response.next_state['measurements'],
+                                                                             self.total_shaped_reward_in_current_episode)
+            else:
+                filtered_env_response.next_state['measurements'] = np.array([self.total_shaped_reward_in_current_episode])
+
+        # there are two cases: standard RL vs. HRL.
+        # in the standard RL scheme, the goal (if exists) comes from the environment. on the other hand, on the HRL
+        # scheme, the goal is given by the upper layer. we need to address both cases here. thus, we take the agent's
+        # existing goal if it is given by the upper layer. otherwise, for the standard RL case, take the environments
+        # goal.
+        goal = self.current_goal if self.current_goal is not None else filtered_env_response.goal
         if self.current_episode_steps_counter > 0:
             transition = Transition(state=copy.copy(self.curr_state), action=self.last_action_info.action,
-                                    reward=filtered_env_response.reward, next_state=filtered_env_response.new_state,
+                                    reward=filtered_env_response.reward, next_state=filtered_env_response.next_state,
                                     game_over=filtered_env_response.game_over, info=filtered_env_response.info,
-                                    goal=filtered_env_response.goal)
+                                    goal=goal)
         else:
-            transition = Transition(next_state=filtered_env_response.new_state,
+            transition = Transition(next_state=filtered_env_response.next_state,
                                     game_over=filtered_env_response.game_over,
                                     info=filtered_env_response.info,
-                                    goal=filtered_env_response.goal)
+                                    goal=goal)
 
         self.curr_state = transition.next_state
 
         # if we are in the first step in the episode, then we don't have a transition yet, and therefore we don't need
         # to store anything in the memory, and we have no reward
         if self.current_episode_steps_counter > 0:
+            # deal with goals given from a higher level agent
+            if hasattr(self, 'goals_action_space'):
+                transition.state['desired_goal'] = goal
+                transition.next_state['desired_goal'] = goal
+                # TODO: allow setting goals which are not part of the state. e.g. state-embedding using get_prediction
+                self.distance_from_goal.add_sample(self.goals_action_space.distance_from_goal(goal, transition.next_state))
+                goal_reward, goal_reached = self.goals_action_space.get_reward_for_goal_and_state(goal, transition.next_state)
+                transition.reward = goal_reward
+                transition.game_over = transition.game_over or goal_reached
+
             # merge the intrinsic reward in
             if self.ap.algorithm.scale_external_reward_by_intrinsic_reward_value:
                 transition.reward = transition.reward * (1 + self.last_action_info.action_intrinsic_reward)
             else:
                 transition.reward = transition.reward + self.last_action_info.action_intrinsic_reward
 
-            # TODO: we want to also have the raw reward for printing
             # sum up the total shaped reward
             self.total_shaped_reward_in_current_episode += transition.reward
             self.total_reward_in_current_episode += env_response.reward
@@ -600,100 +734,25 @@ class Agent(AgentInterface):
             else:
                 transition.add_info(self.last_action_info.__dict__)
 
-            # TODO: implement as a filter
-            if self.ap.algorithm.use_accumulated_reward_as_measurement:
-                transition.next_state['measurements'] = np.append(transition.next_state['measurements'],
-                                                                  self.total_shaped_reward_in_current_episode)
-            # TODO: move to a filter
-            if self.ap.algorithm.add_a_normalized_timestep_to_the_observation:
-                transition.info['timestep'] = float(self.current_episode_steps_counter) / self.env.timestep_limit
+            # make any final changes to the transition if needed
+            transition = self.update_transition_before_adding_to_replay_buffer(transition)
 
             # create and store the transition
             if self.phase in [RunPhase.TRAIN, RunPhase.HEATUP]:
-                self.memory.store(transition)
+                # for episodic memories we keep the transitions in a local buffer until the episode is ended.
+                # for regular memories we insert the transitions directly to the memory
+                if isinstance(self.memory, EpisodicExperienceReplay):
+                    self.current_episode_buffer.insert(transition)
+                else:
+                    self.call_memory('store', transition)
 
             if self.ap.visualization.dump_in_episode_signals:
                 self.update_step_in_episode_log()
 
         return transition.game_over
 
-    # def evaluate(self, num_episodes, keep_networks_synced=False):
-    #     """
-    #     Run in an evaluation mode for several episodes. Actions will be chosen greedily.
-    #     :param keep_networks_synced: keep the online network in sync with the global network after every episode
-    #     :param num_episodes: The number of episodes to evaluate on
-    #     :return: None
-    #     """
-    #
-    #     max_reward_achieved = -float('inf')
-    #     average_evaluation_reward = 0
-    #
-    #     if self.ap.env.check_successes:
-    #         number_successes = 0
-    #
-    #     screen.log_title("Running evaluation")
-    #     self.phase = RunPhase.TEST
-    #     for i in range(num_episodes):
-    #         # keep the online network in sync with the global network
-    #         if keep_networks_synced:
-    #             for network in self.networks.values():
-    #                 network.sync()
-    #
-    #         # act for one episode
-    #         episode_ended = False
-    #         while not episode_ended:
-    #             episode_ended = self.act_and_observe()
-    #
-    #             if keep_networks_synced \
-    #                and self.total_steps_counter % self.ap.algorithm.update_evaluation_agent_network_after_every_num_steps:
-    #                 for network in self.networks.values():
-    #                     network.sync()
-    #
-    #         average_evaluation_reward += self.total_shaped_reward_in_current_episode
-    #
-    #         # check if the reward passed the reward threshold
-    #         if self.ap.env.check_successes:
-    #             if self.ap.env.custom_reward_threshold is not None:
-    #                 reward_threshold = self.ap.env.custom_reward_threshold
-    #             elif self.env.reward_success_threshold is not None:
-    #                 reward_threshold = self.env.reward_success_threshold
-    #             else:
-    #                 raise ValueError("There is no reward threshold defined for the environment")
-    #             if self.total_shaped_reward_in_current_episode >= reward_threshold:
-    #                 number_successes += 1
-    #
-    #         self.reset()
-    #
-    #     # summarize the evaluation phase
-    #     average_evaluation_reward /= float(num_episodes)
-    #     screen.log_title("Evaluation done. Average reward = {}.".format(average_evaluation_reward))
-    #
-    #     # TODO: determine general method for allowing users to specify custom
-    #     # metrics/callbacks
-    #     if self.ap.env.check_successes:
-    #         percent_success = number_successes / float(num_episodes)
-    #         screen.log_title("Percent success = {}.".format(percent_success))
-    #         self.success_ratio.add_sample(percent_success)
-    #
-    #         if percent_success >= 1.0:
-    #             # end training
-    #             self.ap.num_training_iterations = self.training_iteration
-    #
-    #         # TODO: add a flag for this
-    #         mean_reward = self.memory.mean_reward()
-    #         screen.log_title("mean_reward = {}.".format(mean_reward))
-    #         self.mean_reward.add_sample(mean_reward)
-    #
-    #     self.phase = RunPhase.TRAIN
-
     def post_training_commands(self):
         pass
-
-    def save_checkpoint(self, model_id: str="checkpoint"):
-        # TODO: define this as a global saving function and not per network saving function
-        if self.ap.task_parameters.save_model_dir:
-            list(self.networks.values())[0].network_parameters.save_model_dir = self.ap.task_parameters.save_model_dir
-            list(self.networks.values())[0].save_model(model_id)
 
     def get_predictions(self, states: List[Dict[str, np.ndarray]], prediction_type: PredictionType):
         """
@@ -713,6 +772,23 @@ class Agent(AgentInterface):
             raise ValueError("The network has more than one component {} matching the requested prediction_type {}. ".
                              format(list(predictions.keys()), prediction_type))
         return list(predictions.values())[0]
+
+    def set_incoming_directive(self, action: ActionType) -> None:
+        if isinstance(self.in_action_space, GoalsActionSpace):
+            self.current_goal = action
+        elif isinstance(self.in_action_space, AttentionActionSpace):
+            # TODO: this should be reviewed later
+            self.input_filter.observation_filters['attention'].crop_low = action[0]
+            self.input_filter.observation_filters['attention'].crop_high = action[1]
+            self.output_filter.action_filters['masking'].set_masking(action[0], action[1])
+
+    def save_checkpoint(self, checkpoint_id: int) -> None:
+        """
+        Allows agents to store additional information when saving checkpoints.
+        :param checkpoint_id: the id of the checkpoint
+        :return: None
+        """
+        pass
 
     def sync(self) -> None:
         """

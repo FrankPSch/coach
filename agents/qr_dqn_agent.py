@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 from typing import Union
 
-from agents.value_optimization_agent import ValueOptimizationAgent
 import numpy as np
 
 from agents.dqn_agent import DQNAgentParameters, DQNNetworkParameters, DQNAlgorithmParameters
-from configurations import OutputTypes
+from agents.value_optimization_agent import ValueOptimizationAgent
+from architectures.tensorflow_components.heads.quantile_regression_q_head import QuantileRegressionQHeadParameters
 from core_types import StateType
 from schedules import LinearSchedule
 
@@ -27,10 +28,9 @@ from schedules import LinearSchedule
 class QuantileRegressionDQNNetworkParameters(DQNNetworkParameters):
     def __init__(self):
         super().__init__()
-        self.output_types = [OutputTypes.QuantileRegressionQ]
+        self.heads_parameters = [QuantileRegressionQHeadParameters()]
         self.learning_rate = 0.00005
         self.optimizer_epsilon = 0.01 / 32
-        self.neon_support = False
 
 
 class QuantileRegressionDQNAlgorithmParameters(DQNAlgorithmParameters):
@@ -68,36 +68,37 @@ class QuantileRegressionDQNAgent(ValueOptimizationAgent):
         return self.get_q_values(quantile_values)
 
     def learn_from_batch(self, batch):
-        current_states, next_states, actions, rewards, game_overs, _ = self.extract_batch(batch, 'main')
+        network_keys = self.ap.network_wrappers['main'].input_embedders_parameters.keys()
 
         # get the quantiles of the next states and current states
-        next_state_quantiles = self.networks['main'].target_network.predict(next_states)
-        current_quantiles = self.networks['main'].online_network.predict(current_states)
+        next_state_quantiles, current_quantiles = self.networks['main'].parallel_prediction([
+            (self.networks['main'].target_network, batch.next_states(network_keys)),
+            (self.networks['main'].online_network, batch.states(network_keys))
+        ])
 
         # get the optimal actions to take for the next states
         target_actions = np.argmax(self.get_q_values(next_state_quantiles), axis=1)
 
         # calculate the Bellman update
         batch_idx = list(range(self.ap.network_wrappers['main'].batch_size))
-        rewards = np.expand_dims(rewards, -1)
-        game_overs = np.expand_dims(game_overs, -1)
-        TD_targets = rewards + (1.0 - game_overs) * self.ap.algorithm.discount \
+
+        TD_targets = batch.rewards(True) + (1.0 - batch.game_overs(True)) * self.ap.algorithm.discount \
                                * next_state_quantiles[batch_idx, target_actions]
 
         # get the locations of the selected actions within the batch for indexing purposes
-        actions_locations = [[b, a] for b, a in zip(batch_idx, actions)]
+        actions_locations = [[b, a] for b, a in zip(batch_idx, batch.actions())]
 
         # calculate the cumulative quantile probabilities and reorder them to fit the sorted quantiles order
         cumulative_probabilities = np.array(range(self.ap.algorithm.atoms + 1)) / float(self.ap.algorithm.atoms) # tau_i
         quantile_midpoints = 0.5*(cumulative_probabilities[1:] + cumulative_probabilities[:-1])  # tau^hat_i
         quantile_midpoints = np.tile(quantile_midpoints, (self.ap.network_wrappers['main'].batch_size, 1))
-        sorted_quantiles = np.argsort(current_quantiles[batch_idx, actions])
+        sorted_quantiles = np.argsort(current_quantiles[batch_idx, batch.actions()])
         for idx in range(self.ap.network_wrappers['main'].batch_size):
             quantile_midpoints[idx, :] = quantile_midpoints[idx, sorted_quantiles[idx]]
 
         # train
         result = self.networks['main'].train_and_sync_networks({
-            **current_states,
+            **batch.states(network_keys),
             'output_0_0': actions_locations,
             'output_0_1': quantile_midpoints,
         }, TD_targets)

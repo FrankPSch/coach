@@ -15,16 +15,22 @@
 #
 
 import tensorflow as tf
-from configurations import AgentParameters
+
+from architectures.tensorflow_components.heads.head import Head, HeadParameters
+from base_parameters import AgentParameters
 from core_types import QActionStateValue
 from spaces import SpacesDefinition
-from architectures.tensorflow_components.heads.head import Head
+
+
+class CategoricalQHeadParameters(HeadParameters):
+    def __init__(self, activation_function: str ='relu', name: str='categorical_q_head_params'):
+        super().__init__(parameterized_class=CategoricalQHead, activation_function=activation_function, name=name)
 
 
 class CategoricalQHead(Head):
     def __init__(self, agent_parameters: AgentParameters, spaces: SpacesDefinition, network_name: str,
-                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True):
-        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local)
+                 head_idx: int = 0, loss_weight: float = 1., is_local: bool = True, activation_function: str ='relu'):
+        super().__init__(agent_parameters, spaces, network_name, head_idx, loss_weight, is_local, activation_function)
         self.name = 'categorical_dqn_head'
         self.num_actions = len(self.spaces.action.actions)
         self.num_atoms = agent_parameters.algorithm.atoms
@@ -35,12 +41,14 @@ class CategoricalQHead(Head):
         self.input = [self.actions]
 
         values_distribution = tf.layers.dense(input_layer, self.num_actions * self.num_atoms, name='output')
-        values_distribution = tf.reshape(values_distribution, (tf.shape(values_distribution)[0], self.num_actions, self.num_atoms))
+        values_distribution = tf.reshape(values_distribution, (tf.shape(values_distribution)[0], self.num_actions,
+                                                               self.num_atoms))
         # softmax on atoms dimension
         self.output = tf.nn.softmax(values_distribution)
 
         # calculate cross entropy loss
-        self.distributions = tf.placeholder(tf.float32, shape=(None, self.num_actions, self.num_atoms), name="distributions")
+        self.distributions = tf.placeholder(tf.float32, shape=(None, self.num_actions, self.num_atoms),
+                                            name="distributions")
         self.target = self.distributions
         self.loss = tf.nn.softmax_cross_entropy_with_logits(labels=self.target, logits=values_distribution)
         tf.losses.add_loss(self.loss)

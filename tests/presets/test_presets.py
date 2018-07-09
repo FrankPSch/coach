@@ -19,10 +19,24 @@ def test_all_presets_are_running():
     all_presets = sorted([f.split('.')[0] for f in os.listdir('presets') if f.endswith('.py') and f != '__init__.py'])
     for preset in all_presets:
         print("Testing preset {}".format(preset))
-        p = Popen(["python", "coach.py", "-p", preset, "-ns", "-e", ".test"], stdout=DEVNULL)
 
-        # wait 30 seconds for distributed training + 10 seconds overhead of initialization etc.
-        time.sleep(40)
+        # TODO: this is a temporary workaround for presets which define more than a single availalbe level
+        # we should probably do this in a more robust way
+        level = ""
+        if "Atari" in preset:
+            level = "breakout"
+        elif "Mujoco" in preset:
+            level = "inverted_pendulum"
+        elif "ControlSuite" in preset:
+            level = "pendulum:swingup"
+        params = ["python", "coach.py", "-p", preset, "-ns", "-e", ".test"]
+        if level != "":
+            params += ["-lvl", level]
+
+        p = Popen(params, stdout=DEVNULL)
+
+        # wait 10 seconds overhead of initialization etc.
+        time.sleep(10)
         return_value = p.poll()
 
         if return_value is None:

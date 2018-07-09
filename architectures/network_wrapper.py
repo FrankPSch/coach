@@ -14,23 +14,21 @@
 # limitations under the License.
 #
 
-from collections import OrderedDict
-from configurations import Frameworks, AgentParameters
-from logger import failed_imports, screen
 import os
-from spaces import ActionSpace, ObservationSpace, MeasurementsObservationSpace, SpacesDefinition
-from block_factories.block_factory import DistributedTaskParameters
+from collections import OrderedDict
+from typing import List, Tuple
+
+import numpy as np
+
+from base_parameters import Frameworks, AgentParameters, DistributedTaskParameters
+from logger import failed_imports, screen
+from spaces import SpacesDefinition
 
 try:
     import tensorflow as tf
     from architectures.tensorflow_components.general_network import GeneralTensorFlowNetwork
 except ImportError:
     failed_imports.append("TensorFlow")
-
-try:
-    from architectures.neon_components.general_network import GeneralNeonNetwork
-except ImportError:
-    failed_imports.append("Neon")
 
 
 class NetworkWrapper(object):
@@ -47,14 +45,12 @@ class NetworkWrapper(object):
         self.name = name
         self.sess = None
 
-        if self.network_parameters.framework == Frameworks.TensorFlow:
+        if self.network_parameters.framework == Frameworks.tensorflow:
             general_network = GeneralTensorFlowNetwork
-        elif self.network_parameters.framework == Frameworks.Neon:
-            general_network = GeneralNeonNetwork
         else:
             raise Exception("{} Framework is not supported"
                             .format(Frameworks().to_string(self.network_parameters.framework)))
-        # print(worker_device)
+
         with tf.variable_scope("{}/{}".format(self.ap.full_name_id, name)):
 
             # Global network - the main network shared between threads
@@ -90,10 +86,6 @@ class NetworkWrapper(object):
                                                           spaces=spaces,
                                                           network_is_trainable=False)
 
-            if not isinstance(self.ap.task_parameters, DistributedTaskParameters) and \
-                            self.network_parameters.framework == Frameworks.TensorFlow:
-                self.model_saver = tf.train.Saver(tf.global_variables())
-
     def sync(self):
         """
         Initializes the weights of the networks to match each other
@@ -118,19 +110,27 @@ class NetworkWrapper(object):
         if self.global_network:
             self.online_network.set_weights(self.global_network.get_weights(), rate)
 
-    def apply_gradients_to_global_network(self):
+    def apply_gradients_to_global_network(self, gradients=None):
         """
         Apply gradients from the online network on the global network
+        :param gradients: optional gradients that will be used instead of teh accumulated gradients
         :return:
         """
-        self.global_network.apply_gradients(self.online_network.accumulated_gradients)
+        if gradients is None:
+            gradients = self.online_network.accumulated_gradients
+        if self.network_parameters.shared_optimizer:
+            self.global_network.apply_gradients(gradients)
+        else:
+            self.online_network.apply_gradients(gradients)
 
-    def apply_gradients_to_online_network(self):
+    def apply_gradients_to_online_network(self, gradients=None):
         """
         Apply gradients from the online network on itself
         :return:
         """
-        self.online_network.apply_gradients(self.online_network.accumulated_gradients)
+        if gradients is None:
+            gradients = self.online_network.accumulated_gradients
+        self.online_network.apply_gradients(gradients)
 
     def train_and_sync_networks(self, inputs, targets, additional_fetches=[], importance_weights=None):
         """
@@ -143,21 +143,47 @@ class NetworkWrapper(object):
         :return: The loss of the training iteration
         """
         result = self.online_network.accumulate_gradients(inputs, targets, additional_fetches=additional_fetches,
-                                                          importance_weights=importance_weights)
-        self.apply_gradients_and_sync_networks()
+                                                          importance_weights=importance_weights, no_accumulation=True)
+        self.apply_gradients_and_sync_networks(reset_gradients=False)
         return result
 
-    def apply_gradients_and_sync_networks(self):
+    def apply_gradients_and_sync_networks(self, reset_gradients=True):
         """
         Applies the gradients accumulated in the online network to the global network or to itself and syncs the
         networks if necessary
+        :param reset_gradients: If set to True, the accumulated gradients wont be reset to 0 after applying them to
+                                the network. this is useful when the accumulated gradients are overwritten instead
+                                if accumulated by the accumulate_gradients function. this allows reducing time
+                                complexity for this function by around 10%
         """
         if self.global_network:
             self.apply_gradients_to_global_network()
-            self.online_network.reset_accumulated_gradients()
+            if reset_gradients:
+                self.online_network.reset_accumulated_gradients()
             self.update_online_network()
         else:
-            self.online_network.apply_and_reset_gradients(self.online_network.accumulated_gradients)
+            if reset_gradients:
+                self.online_network.apply_and_reset_gradients(self.online_network.accumulated_gradients)
+            else:
+                self.online_network.apply_gradients(self.online_network.accumulated_gradients)
+
+    def parallel_prediction(self, network_input_tuples: List[Tuple]):
+        """
+        Run several network prediction in parallel. Currently this only supports running each of the network once.
+        :param network_input_tuples: a list of tuples where the first element is the network (online_network,
+                                     target_network or global_network) and the second element is the inputs
+        :return: the outputs of all the networks in the same order as the inputs were given
+        """
+        feed_dict = {}
+        fetches = []
+
+        for idx, (network, input) in enumerate(network_input_tuples):
+            feed_dict.update(network.create_feed_dict(input))
+            fetches += network.outputs
+
+        outputs = self.sess.run(fetches, feed_dict)
+
+        return outputs
 
     def get_local_variables(self):
         """
@@ -185,20 +211,3 @@ class NetworkWrapper(object):
         if self.target_network:
             self.target_network.set_session(sess)
 
-        if self.sess and hasattr(self.ap.task_parameters, 'checkpoint_restore_dir') \
-                and self.ap.task_parameters.checkpoint_restore_dir:
-            checkpoint = tf.train.latest_checkpoint(self.ap.task_parameters.checkpoint_restore_dir)
-            screen.log_title("Loading checkpoint: {}".format(checkpoint))
-            self.model_saver.restore(self.sess, checkpoint)
-            self.update_target_network()
-
-    def save_model(self, model_id):
-        saved_model_path = self.model_saver.save(self.sess,
-                                                 os.path.join(self.network_parameters.save_model_dir,
-                                                              str(model_id) + '.ckpt'))
-        screen.log_dict(
-            OrderedDict([
-                ("Saving model", saved_model_path),
-            ]),
-            prefix="Checkpoint"
-        )

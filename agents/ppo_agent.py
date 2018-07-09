@@ -13,33 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+import copy
+from collections import OrderedDict
 from typing import Union
 
-from agents.policy_optimization_agent import PolicyGradientRescaler
-from agents.actor_critic_agent import ActorCriticAgent
-from block_factories.block_factory import DistributedTaskParameters
-from utils import Signal, force_list, eps
-from configurations import InputTypes, OutputTypes, AlgorithmParameters, NetworkParameters, MiddlewareTypes, \
-    AgentParameters, InputEmbedderParameters
-from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
-from architectures.network_wrapper import NetworkWrapper
-from exploration_policies.additive_noise import AdditiveNoiseParameters
 import numpy as np
+
+from agents.actor_critic_agent import ActorCriticAgent
+from agents.policy_optimization_agent import PolicyGradientRescaler
+from architectures.tensorflow_components.heads.ppo_head import PPOHeadParameters
+from architectures.tensorflow_components.heads.v_head import VHeadParameters
+from architectures.tensorflow_components.middlewares.fc_middleware import FCMiddlewareParameters
+from base_parameters import AlgorithmParameters, NetworkParameters, \
+    AgentParameters, InputEmbedderParameters, DistributedTaskParameters
+from core_types import ActionInfo, EnvironmentSteps, Batch
+from exploration_policies.additive_noise import AdditiveNoiseParameters
 from logger import screen
-from core_types import RunPhase, ActionInfo, EnvironmentSteps
-from collections import OrderedDict
-from spaces import Discrete, Box
-import copy
+from memories.episodic_experience_replay import EpisodicExperienceReplayParameters
+from spaces import DiscreteActionSpace, BoxActionSpace
+from utils import force_list, eps
 
 
 class PPOCriticNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.V]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters(activation_function='tanh')}
+        self.middleware_parameters = FCMiddlewareParameters(activation_function='tanh')
+        self.heads_parameters = [VHeadParameters()]
         self.loss_weights = [1.0]
-        self.hidden_layers_activation_function = 'tanh'
         self.async_training = True
         self.l2_regularization = 0
         self.create_target_network = True
@@ -49,12 +51,11 @@ class PPOCriticNetworkParameters(NetworkParameters):
 class PPOActorNetworkParameters(NetworkParameters):
     def __init__(self):
         super().__init__()
-        self.input_types = {'observation': InputEmbedderParameters()}
-        self.middleware_type = MiddlewareTypes.FC
-        self.output_types = [OutputTypes.PPO]
+        self.input_embedders_parameters = {'observation': InputEmbedderParameters(activation_function='tanh')}
+        self.middleware_parameters = FCMiddlewareParameters(activation_function='tanh')
+        self.heads_parameters = [PPOHeadParameters()]
         self.optimizer_type = 'Adam'
         self.loss_weights = [1.0]
-        self.hidden_layers_activation_function = 'tanh'
         self.async_training = True
         self.l2_regularization = 0
         self.create_target_network = True
@@ -69,7 +70,6 @@ class PPOAlgorithmParameters(AlgorithmParameters):
         self.target_kl_divergence = 0.01
         self.initial_kl_coefficient = 1.0
         self.high_kl_penalty_coefficient = 1000
-        self.add_a_normalized_timestep_to_the_observation = False
         self.clip_likelihood_ratio_using_epsilon = None
         self.value_targets_mix_fraction = 0.1
         self.estimate_state_value_using_gae = True
@@ -95,6 +95,7 @@ class PPOAgentParameters(AgentParameters):
 class PPOAgent(ActorCriticAgent):
     def __init__(self, agent_parameters, parent: Union['LevelManager', 'CompositeAgent']=None):
         super().__init__(agent_parameters, parent)
+
         # signals definition
         self.value_loss = self.register_signal('Value Loss')
         self.policy_loss = self.register_signal('Policy Loss')
@@ -103,30 +104,31 @@ class PPOAgent(ActorCriticAgent):
         self.unclipped_grads = self.register_signal('Grads (unclipped)')
 
     def fill_advantages(self, batch):
-        current_states, next_states, actions, rewards, game_overs, total_return = self.extract_batch(batch, "critic")
+        batch = Batch(batch)
+        network_keys = self.ap.network_wrappers['critic'].input_embedders_parameters.keys()
 
         # * Found not to have any impact *
         # current_states_with_timestep = self.concat_state_and_timestep(batch)
 
-        current_state_values = self.networks['critic'].online_network.predict(current_states).squeeze()
+        current_state_values = self.networks['critic'].online_network.predict(batch.states(network_keys)).squeeze()
 
         # calculate advantages
         advantages = []
         if self.policy_gradient_rescaler == PolicyGradientRescaler.A_VALUE:
-            advantages = total_return - current_state_values
+            advantages = batch.total_returns() - current_state_values
         elif self.policy_gradient_rescaler == PolicyGradientRescaler.GAE:
             # get bootstraps
             episode_start_idx = 0
             advantages = np.array([])
-            # current_state_values[game_overs] = 0
-            for idx, game_over in enumerate(game_overs):
+            # current_state_values[batch.game_overs()] = 0
+            for idx, game_over in enumerate(batch.game_overs()):
                 if game_over:
                     # get advantages for the rollout
                     value_bootstrapping = np.zeros((1,))
                     rollout_state_values = np.append(current_state_values[episode_start_idx:idx+1], value_bootstrapping)
 
                     rollout_advantages, _ = \
-                        self.get_general_advantage_estimation_values(rewards[episode_start_idx:idx+1],
+                        self.get_general_advantage_estimation_values(batch.rewards()[episode_start_idx:idx+1],
                                                                      rollout_state_values)
                     episode_start_idx = idx + 1
                     advantages = np.append(advantages, rollout_advantages)
@@ -136,32 +138,32 @@ class PPOAgent(ActorCriticAgent):
         # standardize
         advantages = (advantages - np.mean(advantages)) / np.std(advantages)
 
-        for transition, advantage in zip(self.memory.transitions, advantages):
+        for transition, advantage in zip(self.memory.transitions, advantages):  # TODO: this will be problematic with a shared memory
             transition.info['advantage'] = advantage
 
         self.action_advantages.add_sample(advantages)
 
     def train_value_network(self, dataset, epochs):
         loss = []
-        current_states, _, _, _, _, total_return = self.extract_batch(dataset, 'critic')
+        batch = Batch(dataset)
+        network_keys = self.ap.network_wrappers['critic'].input_embedders_parameters.keys()
 
         # * Found not to have any impact *
         # add a timestep to the observation
         # current_states_with_timestep = self.concat_state_and_timestep(dataset)
 
-        total_return = np.expand_dims(total_return, -1)
         mix_fraction = self.ap.algorithm.value_targets_mix_fraction
         for j in range(epochs):
-            batch_size = len(dataset)
+            curr_batch_size = batch.size
             if self.networks['critic'].online_network.optimizer_type != 'LBFGS':
-                batch_size = self.ap.network_wrappers['critic'].batch_size
-            for i in range(len(dataset) // batch_size):
+                curr_batch_size = self.ap.network_wrappers['critic'].batch_size
+            for i in range(batch.size // curr_batch_size):
                 # split to batches for first order optimization techniques
                 current_states_batch = {
-                    k: v[i * batch_size:(i + 1) * batch_size]
-                    for k, v in current_states.items()
+                    k: v[i * curr_batch_size:(i + 1) * curr_batch_size]
+                    for k, v in batch.states(network_keys).items()
                 }
-                total_return_batch = total_return[i * batch_size:(i + 1) * batch_size]
+                total_return_batch = batch.total_returns(True)[i * curr_batch_size:(i + 1) * curr_batch_size]
                 old_policy_values = force_list(self.networks['critic'].target_network.predict(
                     current_states_batch).squeeze())
                 if self.networks['critic'].online_network.optimizer_type != 'LBFGS':
@@ -204,20 +206,24 @@ class PPOAgent(ActorCriticAgent):
             }
             #shuffle(dataset)
             for i in range(len(dataset) // self.ap.network_wrappers['actor'].batch_size):
-                batch = dataset[i * self.ap.network_wrappers['actor'].batch_size:(i + 1) * self.ap.network_wrappers['actor'].batch_size]
-                current_states, _, actions, _, _, total_return = self.extract_batch(batch, 'actor')
-                advantages = np.array([t.info['advantage'] for t in batch])
-                if not isinstance(self.spaces.action, Discrete) and len(actions.shape) == 1:
+                batch = Batch(dataset[i * self.ap.network_wrappers['actor'].batch_size:
+                                      (i + 1) * self.ap.network_wrappers['actor'].batch_size])
+
+                network_keys = self.ap.network_wrappers['actor'].input_embedders_parameters.keys()
+
+                advantages = batch.info('advantage')
+                actions = batch.actions()
+                if not isinstance(self.spaces.action, DiscreteActionSpace) and len(actions.shape) == 1:
                     actions = np.expand_dims(actions, -1)
 
                 # get old policy probabilities and distribution
-                old_policy = force_list(self.networks['actor'].target_network.predict(current_states))
+                old_policy = force_list(self.networks['actor'].target_network.predict(batch.states(network_keys)))
 
                 # calculate gradients and apply on both the local policy network and on the global policy network
                 fetches = [self.networks['actor'].online_network.output_heads[0].kl_divergence,
                            self.networks['actor'].online_network.output_heads[0].entropy]
 
-                inputs = copy.copy(current_states)
+                inputs = copy.copy(batch.states(network_keys))
                 # TODO: why is this output 0 and not output 1?
                 inputs['output_0_0'] = actions
                 # TODO: does old_policy_distribution really need to be represented as a list?
@@ -300,7 +306,7 @@ class PPOAgent(ActorCriticAgent):
             self.update_kl_coefficient()
 
         # clean memory
-        self.memory.clean()
+        self.call_memory('clean')
 
     def train(self):
         loss = 0
@@ -322,58 +328,11 @@ class PPOAgent(ActorCriticAgent):
                 self.value_loss.add_sample(value_loss)
                 self.policy_loss.add_sample(policy_loss)
 
+            self.post_training_commands()
             self.training_iteration += 1
             self.update_log()  # should be done in order to update the data that has been accumulated * while not playing *
             return np.append(value_loss, policy_loss)
 
-    # def choose_action(self, curr_state):
-    #     # TODO: shouldn't this be inherited?
-    #     # convert to batch so we can run it through the network
-    #     tf_input_state = self.dict_state_to_batches_dict(curr_state, 'actor')
-    #     if isinstance(self.spaces.action, Discrete):
-    #         # DISCRETE
-    #         action_values = self.networks['actor'].online_network.predict(tf_input_state).squeeze()
-    #
-    #         action = self.exploration_policy.get_action(action_values)
-    #         action_info = ActionInfo(action=action, action_probability=action_values[action])
-    #     elif isinstance(self.spaces.action, Box):
-    #         # CONTINUOUS
-    #         action_values_mean, action_values_std = self.networks['actor'].online_network.predict(tf_input_state)
-    #         action_values_mean = action_values_mean.squeeze()
-    #         action_values_std = action_values_std.squeeze()
-    #         # TODO: rewrite this using exploration policies
-    #         if self._phase == RunPhase.TRAIN:
-    #             action = np.squeeze(np.random.randn(self.spaces.action.shape) * action_values_std + action_values_mean)
-    #         else:
-    #             action = action_values_mean
-    #         action_info = ActionInfo(action=action, action_probability=action_values_mean)
-    #     else:
-    #         raise ValueError("The action space of the environment is not compatible with the algorithm")
-    #
-    #     return action_info
-
-    def choose_action(self, curr_state):
-        # TODO: shouldn't this be inherited?
-        # convert to batch so we can run it through the network
-        tf_input_state = self.dict_state_to_batches_dict(curr_state, 'actor')
-        if isinstance(self.spaces.action, Discrete):
-            # DISCRETE
-            action_probabilities = self.networks['actor'].online_network.predict(tf_input_state)
-
-            action_probabilities = action_probabilities.squeeze()
-            action = self.exploration_policy.get_action(action_probabilities)
-            action_info = ActionInfo(action=action,
-                                     action_probability=action_probabilities[action])
-
-            self.entropy.add_sample(-np.sum(action_probabilities * np.log(action_probabilities + eps)))
-        elif isinstance(self.spaces.action, Box):
-            # CONTINUOUS
-            action_values = self.networks['actor'].online_network.predict(tf_input_state)
-
-            action = self.exploration_policy.get_action(action_values)
-
-            action_info = ActionInfo(action=action)
-        else:
-            raise ValueError("The action space of the environment is not compatible with the algorithm")
-
-        return action_info
+    def get_prediction(self, states):
+        tf_input_state = self.prepare_batch_for_inference(states, "actor")
+        return self.networks['actor'].online_network.predict(tf_input_state)

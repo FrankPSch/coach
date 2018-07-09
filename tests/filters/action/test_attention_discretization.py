@@ -4,7 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pytest
 from filters.action.attention_discretization import AttentionDiscretization
-from spaces import Box, Discrete, Attention
+from spaces import BoxActionSpace, DiscreteActionSpace, AttentionActionSpace
 import numpy as np
 
 
@@ -14,12 +14,12 @@ def test_filter():
 
     # passing an output space that is wrong
     with pytest.raises(ValueError):
-        filter.validate_output_action_space(Discrete(10))
+        filter.validate_output_action_space(DiscreteActionSpace(10))
     with pytest.raises(ValueError):
-        filter.validate_output_action_space(Box(10))
+        filter.validate_output_action_space(BoxActionSpace(10))
 
     # 1 dimensional box
-    output_space = Attention(2, 0, 83)
+    output_space = AttentionActionSpace(2, 0, 83)
     input_space = filter.get_unfiltered_action_space(output_space)
 
     assert np.all(filter.target_actions == np.array([[[0., 0.], [41.5, 41.5]],

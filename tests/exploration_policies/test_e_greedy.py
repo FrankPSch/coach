@@ -4,7 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pytest
 
-from spaces import Discrete, Box
+from spaces import DiscreteActionSpace, BoxActionSpace
 from exploration_policies.e_greedy import EGreedy
 from schedules import LinearSchedule
 import numpy as np
@@ -14,7 +14,7 @@ from core_types import RunPhase
 @pytest.mark.unit_test
 def test_get_action():
     # discrete control
-    action_space = Discrete(3)
+    action_space = DiscreteActionSpace(3)
     epsilon_schedule = LinearSchedule(1.0, 1.0, 1000)
     policy = EGreedy(action_space, epsilon_schedule, evaluation_epsilon=0)
 
@@ -38,7 +38,7 @@ def test_get_action():
 @pytest.mark.unit_test
 def test_change_phase():
     # discrete control
-    action_space = Discrete(3)
+    action_space = DiscreteActionSpace(3)
     epsilon_schedule = LinearSchedule(1.0, 0.1, 1000)
     policy = EGreedy(action_space, epsilon_schedule, evaluation_epsilon=0.01)
 
@@ -58,7 +58,7 @@ def test_change_phase():
 @pytest.mark.unit_test
 def test_get_control_param():
     # discrete control
-    action_space = Discrete(3)
+    action_space = DiscreteActionSpace(3)
     epsilon_schedule = LinearSchedule(1.0, 0.1, 1000)
     policy = EGreedy(action_space, epsilon_schedule, evaluation_epsilon=0.01)
 

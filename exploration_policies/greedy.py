@@ -14,11 +14,13 @@
 # limitations under the License.
 #
 
-from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
-from spaces import ActionSpace, Discrete, Box
-import numpy as np
-from core_types import ActionType
 from typing import List
+
+import numpy as np
+
+from core_types import ActionType
+from exploration_policies.exploration_policy import ExplorationPolicy, ExplorationParameters
+from spaces import ActionSpace, DiscreteActionSpace, BoxActionSpace
 
 
 class GreedyParameters(ExplorationParameters):
@@ -35,9 +37,9 @@ class Greedy(ExplorationPolicy):
         super().__init__(action_space)
 
     def get_action(self, action_values: List[ActionType]) -> ActionType:
-        if type(self.action_space) == Discrete:
+        if type(self.action_space) == DiscreteActionSpace:
             return np.argmax(action_values)
-        if type(self.action_space) == Box:
+        if type(self.action_space) == BoxActionSpace:
             return action_values
 
     def get_control_param(self):

@@ -16,7 +16,7 @@
 
 from typing import List
 
-from configurations import Parameters
+from base_parameters import Parameters
 from core_types import RunPhase, ActionType
 from spaces import ActionSpace
 
@@ -61,6 +61,15 @@ class ExplorationPolicy(object):
         :return: none
         """
         self.phase = phase
+
+    def requires_action_values(self) -> bool:
+        """
+        Allows exploration policies to define if they require the action values for the current step.
+        This can save up a lot of computation. For example in e-greedy, if the random value generated is smaller
+        than epsilon, the action is completely random, and the action values don't need to be calculated
+        :return: True if the action values are required. False otherwise
+        """
+        return True
 
     def get_control_param(self):
         return 0
