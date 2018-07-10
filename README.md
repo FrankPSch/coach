@@ -1,5 +1,3 @@
-<img src="img/coach_logo.png" alt="Doom Deathmatch" width="400"/>
-
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/NervanaSystems/coach/blob/master/LICENSE)
 [![Docs](https://media.readthedocs.org/static/projects/badges/passing-flat.svg)](https://nervanasystems.github.io/coach/)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1134898.svg)](https://doi.org/10.5281/zenodo.1134898)
